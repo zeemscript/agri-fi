@@ -1,0 +1,322 @@
+import { Metadata } from 'next';
+import Link from 'next/link';
+import { notFound } from 'next/navigation';
+import { setRequestLocale } from 'next-intl/server';
+import nextDynamic from 'next/dynamic';
+import { getDealById, Milestone } from '@/lib/api';
+import FundingProgressBar from '@/components/FundingProgressBar';
+import StatusBadge from '@/components/StatusBadge';
+import ErrorBoundary from '@/components/ErrorBoundary';
+import InvestmentSection from '@/components/InvestmentSection';
+import DealStats from '@/components/marketplace/DealStats';
+
+// Heavy client components — loaded as separate chunks that are only fetched
+// when the browser renders this page, not included in the shared JS bundle.
+const ShipmentTimeline = nextDynamic(
+  () => import('@/components/ShipmentTimeline').then(m => ({ default: m.ShipmentTimeline })),
+  {
+    loading: () => <div className="h-40 skeleton rounded-2xl" aria-label="Loading timeline…" />,
+  },
+);
+
+const ShipmentMap = nextDynamic(
+  () => import('@/components/dashboard/ShipmentMap').then(m => ({ default: m.ShipmentMap })),
+  {
+    ssr: false,
+    loading: () => <div className="h-64 skeleton rounded-2xl" aria-label="Loading map…" />,
+  },
+);
+
+const ActivityFeed = nextDynamic(
+  () => import('@/components/deals/ActivityFeed').then(m => ({ default: m.ActivityFeed })),
+  {
+    ssr: false,
+    loading: () => <div className="h-48 skeleton rounded-2xl" aria-label="Loading activity feed…" />,
+  },
+);
+
+const DealHealthWidget = nextDynamic(
+  () => import('@/components/deals/DealHealthWidget').then(m => ({ default: m.DealHealthWidget })),
+  {
+    ssr: false,
+    loading: () => <div className="h-40 skeleton rounded-2xl" aria-label="Loading deal health…" />,
+  },
+);
+
+// Real-time collaboration presence (#1234) — client-only, connects over WebSocket.
+const CollaborationPresence = nextDynamic(
+  () => import('@/components/collaboration/CollaborationPresence').then(m => ({ default: m.CollaborationPresence })),
+  {
+    ssr: false,
+    loading: () => <div className="h-12 skeleton rounded-2xl" aria-label="Loading collaborators…" />,
+  },
+);
+
+export const dynamic = 'force-static';
+export const dynamicParams = false;
+export const revalidate = false;
+
+export function generateStaticParams() {
+  const ids = (process.env.STATIC_MARKETPLACE_IDS || '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean);
+
+  return ids.map((id) => ({ id }));
+}
+
+export async function generateMetadata({
+  params,
+}: {
+  params: { id: string; locale: string };
+}): Promise<Metadata> {
+  try {
+    const deal = await getDealById(params.id);
+    if (!deal) return { title: 'Deal Not Found | AgriFi' };
+
+    const commodity =
+      deal.commodity.charAt(0).toUpperCase() + deal.commodity.slice(1);
+    const totalValue = Number(deal.total_value);
+    const totalInvested = Number(deal.total_invested);
+
+    const fundingPct =
+      totalValue > 0
+        ? Math.min(Math.round((totalInvested / totalValue) * 100), 100)
+        : 0;
+
+    // Estimated ROI: platform distributes 98% of deal value to investors.
+    const roi =
+      totalInvested > 0
+        ? ((totalValue * 0.98 - totalInvested) / totalInvested) * 100
+        : 0;
+    const roiLabel =
+      roi > 0 ? `+${roi.toFixed(1)}% target ROI` : 'Earn returns on delivery';
+
+    const formattedTotalValue = new Intl.NumberFormat(params.locale, {
+      style: 'currency',
+      currency: 'USD',
+      maximumFractionDigits: 0,
+    }).format(totalValue);
+    const title = `Invest in ${commodity} — ${formattedTotalValue} USD | AgriFi`;
+    const description =
+      `${new Intl.NumberFormat(params.locale).format(Number(deal.quantity))} ${deal.quantity_unit} of ${commodity}. ` +
+      `${fundingPct}% funded · ${roiLabel}. ` +
+      `Delivery by ${new Date(deal.delivery_date).toLocaleDateString('en', {
+        month: 'long',
+        day: 'numeric',
+        year: 'numeric',
+      })}.`;
+
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'https://agri-fi.app';
+    const pageUrl = `${appUrl}/marketplace/${deal.id}`;
+    const ogImage = `${appUrl}/og-default.png`;
+
+    return {
+      title,
+      description,
+      openGraph: {
+        type: 'website',
+        url: pageUrl,
+        siteName: 'AgriFi',
+        title,
+        description,
+        images: [
+          {
+            url: ogImage,
+            width: 1200,
+            height: 630,
+            alt: `${commodity} trade deal on AgriFi`,
+          },
+        ],
+      },
+      twitter: {
+        card: 'summary_large_image',
+        title,
+        description,
+        images: [ogImage],
+      },
+      alternates: {
+        canonical: pageUrl,
+      },
+    };
+  } catch {
+    return { title: 'Trade Deal | AgriFi' };
+  }
+}
+
+const MILESTONE_ORDER = ['farm', 'warehouse', 'port', 'importer'];
+
+export default async function DealDetailPage({ params }: { params: { id: string; locale: string } }) {
+  // force-static: next-intl can't read the locale from middleware headers.
+  setRequestLocale(params.locale);
+  let deal: Awaited<ReturnType<typeof getDealById>> = null;
+  try { deal = await getDealById(params.id); } catch { notFound(); }
+  if (!deal) notFound();
+
+  const milestones = [...(deal.milestones ?? [])].sort((a, b) => {
+    const ai = MILESTONE_ORDER.indexOf(a.milestone as string);
+    const bi = MILESTONE_ORDER.indexOf(b.milestone as string);
+    return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+  });
+
+  const pct = deal.total_value > 0
+    ? Math.min((Number(deal.total_invested) / Number(deal.total_value)) * 100, 100) : 0;
+
+  return (
+    <ErrorBoundary>
+      {/* Navbar */}
+      <nav className="glass sticky top-0 z-20 border-b border-slate-100">
+        <div className="max-w-4xl mx-auto px-4 sm:px-6 flex items-center justify-between h-14">
+          <Link href="/marketplace" className="flex items-center gap-1.5 text-sm text-slate-500 hover:text-slate-900 transition-colors">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7"/>
+            </svg>
+            Marketplace
+          </Link>
+          <Link href="/" className="flex items-center gap-2 font-black text-slate-900">
+            <span className="text-xl">🌾</span> AgriFi
+          </Link>
+          <div className="w-24" /> {/* spacer */}
+        </div>
+      </nav>
+
+      <main className="min-h-screen bg-slate-50 px-4 py-8">
+        <div className="max-w-4xl mx-auto space-y-5">
+
+          {/* Real-time collaboration presence — Issue #1234 */}
+          <CollaborationPresence resourceType="deal" resourceId={deal.id} />
+
+          {/* Hero card */}
+          <div className="card overflow-hidden">
+            {/* Progress bar top accent */}
+            <div className="h-1.5 bg-slate-100">
+              <div className="h-full bg-gradient-to-r from-brand-400 to-emerald-500 transition-all duration-700"
+                style={{ width: `${pct}%` }} />
+            </div>
+
+            <div className="p-6 sm:p-8">
+              <div className="flex items-start justify-between gap-4 mb-6">
+                <div>
+                  <h1 className="text-3xl font-black text-slate-900 capitalize tracking-tight">{deal.commodity}</h1>
+                  <p className="text-slate-400 font-mono text-sm mt-1">{deal.token_symbol}</p>
+                </div>
+                <div className="flex flex-col items-end gap-2">
+                  <div className="flex items-center gap-2">
+                    {deal.esg_score != null && (
+                      <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                        <span>🌱</span> ESG {deal.esg_rating ?? 'Rated'} · {deal.esg_score}
+                      </span>
+                    )}
+                    <StatusBadge status={deal.status} />
+                  </div>
+                  <Link href={`/marketplace/${deal.id}/trade`} className="btn-secondary text-xs px-3 py-1.5">
+                    Trade on DEX →
+                  </Link>
+                </div>
+              </div>
+
+              {/* Stats grid */}
+              <DealStats
+                quantity={deal.quantity}
+                quantityUnit={deal.quantity_unit}
+                totalValue={deal.total_value}
+                tokenPrice={Number(deal.total_value) / Number(deal.token_count)}
+                tokensRemaining={deal.tokens_remaining}
+                deliveryDate={deal.delivery_date}
+              />
+
+              {/* ESG Impact Highlight Card (#1012) */}
+              {deal.esg_score != null && (
+                <div className="mb-6 p-4 rounded-2xl bg-gradient-to-br from-emerald-50/60 to-teal-50/60 border border-emerald-100">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xl">🌍</span>
+                      <div>
+                        <h4 className="text-xs font-bold text-emerald-950 uppercase tracking-wider">Institutional Impact Score</h4>
+                        <p className="text-xs text-emerald-800">Verified environmental, social, and governance evaluation</p>
+                      </div>
+                    </div>
+                    <span className="text-sm font-extrabold px-2.5 py-1 rounded-xl bg-white shadow-sm text-emerald-700 border border-emerald-200">
+                      Tier {deal.esg_rating ?? 'A'}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 text-center text-xs">
+                    <div className="p-2.5 rounded-xl bg-white/80 border border-emerald-100">
+                      <p className="text-[10px] font-semibold text-slate-400 uppercase">Environmental</p>
+                      <p className="text-sm font-bold text-emerald-700 mt-0.5">{deal.environmental_score ?? '—'}/100</p>
+                    </div>
+                    <div className="p-2.5 rounded-xl bg-white/80 border border-emerald-100">
+                      <p className="text-[10px] font-semibold text-slate-400 uppercase">Social</p>
+                      <p className="text-sm font-bold text-teal-700 mt-0.5">{deal.social_score ?? '—'}/100</p>
+                    </div>
+                    <div className="p-2.5 rounded-xl bg-white/80 border border-emerald-100">
+                      <p className="text-[10px] font-semibold text-slate-400 uppercase">Governance</p>
+                      <p className="text-sm font-bold text-indigo-700 mt-0.5">{deal.governance_score ?? '—'}/100</p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Funding progress */}
+              <FundingProgressBar
+                totalValue={Number(deal.total_value)}
+                totalInvested={Number(deal.total_invested)}
+              />
+
+              {/* Investment CTA */}
+              <InvestmentSection deal={deal} />
+            </div>
+          </div>
+
+          {/* Deal Health Indicators — Issue #1002 */}
+          <DealHealthWidget dealId={deal.id} />
+
+          <div className="grid sm:grid-cols-2 gap-5">
+            {/* Documents */}
+            <div className="card p-6">
+              <h2 className="section-title mb-4">Documents</h2>
+              {!deal.documents || deal.documents.length === 0 ? (
+                <div className="text-center py-6">
+                  <p className="text-3xl mb-2">📄</p>
+                  <p className="text-sm text-slate-400">No documents uploaded yet</p>
+                </div>
+              ) : (
+                <ul className="divide-y divide-slate-100">
+                  {deal.documents.map(doc => (
+                    <li key={doc.id} className="py-3 flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-semibold text-slate-900 capitalize">
+                          {doc.doc_type.replace(/_/g, ' ')}
+                        </p>
+                        <p className="text-xs text-slate-400">{new Date(doc.created_at).toLocaleDateString()}</p>
+                      </div>
+                      <a href={`https://ipfs.io/ipfs/${doc.ipfs_hash}`}
+                        target="_blank" rel="noopener noreferrer"
+                        className="text-xs text-brand-600 hover:underline font-mono truncate max-w-[120px]">
+                        {doc.ipfs_hash.slice(0, 12)}…
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            {/* Milestones */}
+            <div className="card p-6">
+              <ShipmentTimeline tradeDealId={deal.id} initialMilestones={milestones} />
+            </div>
+          </div>
+
+          {/* Shipment Map — Issue #247 */}
+          <ShipmentMap tradeDealId={deal.id} className="w-full" />
+
+          {/* Activity Feed — Issue #863 */}
+          <div className="card p-6">
+            <ActivityFeed tradeDealId={deal.id} />
+          </div>
+
+        </div>
+      </main>
+    </ErrorBoundary>
+  );
+}

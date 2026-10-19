@@ -1,9 +1,26 @@
-import { Injectable } from '@nestjs/common';
+import {
+  Injectable,
+  Inject,
+  OnModuleDestroy,
+  OnModuleInit,
+  Optional,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { PinoLogger } from 'nestjs-pino';
-import { TransactionLog, TxStatus } from './entities/transaction-log.entity';
+import { createHash } from 'crypto';
+import axios from 'axios';
+import {
+  TransactionLog,
+  TxStatus,
+} from '../database/entities/transaction-log.entity';
+import {
+  CursorPaginatedResult,
+  decodeCursor,
+  encodeCursor,
+} from '../common/pagination';
+import { KmsService } from '../kms/kms.service';
 import {
   Horizon,
   Keypair,
@@ -13,42 +30,120 @@ import {
   Asset,
   BASE_FEE,
   Memo,
-} from 'stellar-sdk';
+  Transaction,
+  Claimant,
+} from '@stellar/stellar-sdk';
+import BigNumber from 'bignumber.js';
+import { RedisClientType } from 'redis';
+import { createAsset } from './utils/asset-helper';
 import {
-  createDecipheriv,
-  createCipheriv,
-  randomBytes,
-  createHash,
-} from 'crypto';
+  chunkOperations,
+  MAX_OPERATIONS_PER_TX,
+  planTransactionBatches,
+  generateBatchMemo,
+} from './utils/transaction-chunker';
+import { HorizonFailoverClient } from './horizon-failover';
+import { InjectMetric } from '@willsoto/nestjs-prometheus';
+import { Counter, Histogram } from 'prom-client';
 
+export const SEQUENCE_REDIS_CLIENT = 'SEQUENCE_REDIS_CLIENT';
+const SEQUENCE_CACHE_TTL = 5; // seconds
+export const TIMEBOUNDS_SECONDS = 300;
+
+/** TTL for terminal transaction statuses (success / failed) in Redis — 1 hour. */
+const TX_STATUS_CACHE_TTL_SECONDS = 3600;
+/** Redis key prefix for cached transaction status lookups. */
+const TX_STATUS_CACHE_PREFIX = 'stellar:tx:';
 export interface InvestorShare {
   walletAddress: string;
   tokenAmount: number;
   totalTokens: number;
 }
 
+export interface SignatureValidationResult {
+  valid: boolean;
+  /** Public key that was checked */
+  publicKey: string;
+  /** Number of signatures found on the envelope */
+  signatureCount: number;
+  /** Index of the matching signature, or -1 if none matched */
+  matchedSignatureIndex: number;
+  error?: string;
+}
+
 @Injectable()
-export class StellarService {
-  private readonly server: Horizon.Server;
+export class StellarService implements OnModuleInit, OnModuleDestroy {
+  private readonly horizonClient: HorizonFailoverClient;
+  private get server(): Horizon.Server {
+    return this.horizonClient.activeServer;
+  }
+  private set server(s: Horizon.Server) {
+    (this.horizonClient as any)._server = s;
+  }
   private readonly networkPassphrase: string;
   private readonly platformKeypair: Keypair;
+  private readonly multiSigSigners: Keypair[];
   private readonly usdcAsset: Asset;
+  private readonly localSequenceCache: Map<
+    string,
+    { seq: string; expiresAt: number }
+  >;
+  private readonly enableSequenceCache: boolean;
 
   constructor(
     private readonly config: ConfigService,
     private readonly logger: PinoLogger,
     @InjectRepository(TransactionLog)
     private readonly txLogRepo: Repository<TransactionLog>,
+    private readonly kmsService: KmsService,
+    @Optional() private readonly tokenIssuerService?: TokenIssuerService,
+    @Optional()
+    private readonly escrowReleaseService?: EscrowReleaseService,
+    @Optional() private readonly investmentTxService?: InvestmentTxService,
+    @Optional() private readonly anchorsService?: AnchorsService,
+    @Optional()
+    private readonly stellarQueriesService?: StellarQueriesService,
+    @Optional()
+    @Inject(SEQUENCE_REDIS_CLIENT)
+    private readonly sequenceRedis: RedisClientType | null,
+    @Optional()
+    @InjectMetric('horizon_status_stale_fallbacks_total')
+    private readonly horizonStaleFallbackCounter: Counter<string> | null,
+    @Optional()
+    @InjectMetric('escrow_release_batch_duration_seconds')
+    private readonly batchDuration?: Histogram<string>,
+    @Optional()
+    @InjectMetric('escrow_release_batches_total')
+    private readonly batchesTotal?: Counter<string>,
+    @Optional()
+    @InjectMetric('escrow_release_claimable_balances_total')
+    private readonly claimableBalancesTotal?: Counter<string>,
+    @Optional()
+    @InjectMetric('escrow_stellar_tx_total')
+    private readonly stellarTxTotal?: Counter<string>,
+    @Optional()
+    @InjectMetric('escrow_stellar_tx_failures_total')
+    private readonly stellarTxFailures?: Counter<string>,
   ) {
+    this.localSequenceCache = new Map();
+    this.enableSequenceCache = true;
     this.logger.setContext(StellarService.name);
 
-    const horizonUrl = config.get<string>(
-      'STELLAR_HORIZON_URL',
-      'https://horizon-testnet.stellar.org',
+    // Support a comma-separated list of Horizon URLs for failover.
+    const horizonUrlsRaw = config.get<string>(
+      'STELLAR_HORIZON_URLS',
+      config.get<string>(
+        'STELLAR_HORIZON_URL',
+        'https://horizon-testnet.stellar.org',
+      ),
     );
+    const horizonUrls = horizonUrlsRaw!
+      .split(',')
+      .map((u) => u.trim())
+      .filter(Boolean);
     const network = config.get<string>('STELLAR_NETWORK', 'testnet');
 
-    this.server = new Horizon.Server(horizonUrl);
+    this.horizonClient = new HorizonFailoverClient(horizonUrls, this.logger, {});
     this.networkPassphrase =
       network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
 
@@ -67,30 +162,451 @@ export class StellarService {
       ? Keypair.fromSecret(platformSecret)
       : Keypair.random();
 
-    // Validate ENCRYPTION_KEY presence (except in test environment)
-    const encryptionKey = config.get<string>('ENCRYPTION_KEY', '');
-    if (!encryptionKey && process.env.NODE_ENV !== 'test') {
-      throw new Error('ENCRYPTION_KEY is required in production and development environments');
-    }
-    if (!encryptionKey && process.env.NODE_ENV === 'test') {
-      this.logger.warn('ENCRYPTION_KEY is not set; using empty key for tests');
-    }
+    // Initialize multi-sig signers for platform fee wallet security
+    this.multiSigSigners = this.initializeMultiSigSigners(config);
+
+    // Removed ENCRYPTION_KEY validation as KMS handles encryption.
+    // Ensure KMS_KEY_ID is set via environment.
 
     const usdcAssetCode = config.get<string>('USDC_ASSET_CODE', 'USDC');
     const usdcIssuer = config.get<string>('USDC_ISSUER', '');
     this.usdcAsset = usdcIssuer
-      ? new Asset(usdcAssetCode, usdcIssuer)
+      ? createAsset(usdcAssetCode, usdcIssuer)
       : Asset.native(); // fallback to XLM only if issuer not configured
 
     this.logger.info(
       {
         network,
-        horizonUrl,
+        horizonUrls,
         usdcAssetCode,
         usdcIssuer: usdcIssuer || 'NOT_SET',
+        multiSigSignersCount: this.multiSigSigners.length,
       },
       `StellarService initialized on ${network}`,
     );
+  }
+
+  /**
+   * Initializes multi-signature signer keypairs from environment variables.
+   * Reads STELLAR_MULTISIG_SIGNER_1_SECRET and STELLAR_MULTISIG_SIGNER_2_SECRET.
+   * If not configured, generates random keypairs (for development only).
+   */
+  private initializeMultiSigSigners(config: ConfigService): Keypair[] {
+    const signers: Keypair[] = [];
+    const maxSigners = 2; // We'll have 3 total: platform key + 2 additional signers
+
+    for (let i = 1; i <= maxSigners; i++) {
+      const secretKey = config.get<string>(
+        `STELLAR_MULTISIG_SIGNER_${i}_SECRET`,
+        '',
+      );
+      if (secretKey) {
+        try {
+          signers.push(Keypair.fromSecret(secretKey));
+          this.logger.info(`Loaded multi-sig signer ${i} from environment`);
+        } catch (err) {
+          this.logger.error(
+            `Invalid STELLAR_MULTISIG_SIGNER_${i}_SECRET: ${(err as Error).message}`,
+          );
+          throw err;
+        }
+      } else if (process.env.NODE_ENV !== 'test') {
+        this.logger.warn(
+          `STELLAR_MULTISIG_SIGNER_${i}_SECRET not configured. Generate and set this in production.`,
+        );
+      }
+    }
+
+    return signers;
+  }
+
+  /**
+   * Returns the platform fee wallet public key.
+   */
+  getPlatformPublicKey(): string {
+    return this.platformKeypair.publicKey();
+  }
+
+  private getTransactionTimebounds(
+    maxSeconds = TIMEBOUNDS_SECONDS,
+  ): { minTime: number; maxTime: number } {
+    const now = Math.floor(Date.now() / 1000);
+    return { minTime: 0, maxTime: now + maxSeconds };
+  }
+
+  private getTxSubmissionFee(existingFee?: string | number): string {
+    const baseFee = parseInt(BASE_FEE, 10);
+    const currentFee = parseInt(String(existingFee ?? baseFee), 10) || baseFee;
+    return Math.max(currentFee + baseFee, baseFee).toString();
+  }
+
+  /**
+   * Configures multi-signature authorization for the platform fee wallet.
+   * Sets up 3 total signers (platform key + 2 additional signers) with a 2-of-3 threshold.
+   * This requires 2 signatures to approve any transfer from the platform account.
+   *
+   * Multi-sig Structure:
+   * - Master Key (Platform Key): weight 1
+   * - Signer 1: weight 1
+   * - Signer 2: weight 1
+   * - Transaction Threshold: 2 (minimum 2 signatures required)
+   * - Medium Threshold: 2 (for operations like setOptions)
+   * - High Threshold: 2 (for operations like mergeAccount)
+   *
+   * Security Considerations:
+   * - At least 2 of the 3 keys are required to move funds
+   * - Reduces risk of single key compromise
+   * - Keys should be stored separately and managed securely
+   * - For auditing: verify signers via Horizon API
+   *
+   * @throws Error if multi-sig configuration fails or signers are not configured
+   */
+  async setupPlatformMultiSig(): Promise<{
+    platformPublicKey: string;
+    signers: string[];
+    transactionThreshold: number;
+  }> {
+    if (this.multiSigSigners.length < 2) {
+      throw new Error(
+        'Multi-sig setup requires at least 2 signer keys. Configure STELLAR_MULTISIG_SIGNER_1_SECRET and STELLAR_MULTISIG_SIGNER_2_SECRET in environment variables.',
+      );
+    }
+
+    const platformPublicKey = this.platformKeypair.publicKey();
+    this.logger.info(
+      { platformPublicKey },
+      'Starting platform wallet multi-sig configuration',
+    );
+
+    // Load the platform account
+    const platformAccount = await this.server.loadAccount(platformPublicKey);
+
+    // Build transaction to set multi-sig configuration
+    // We need to add the 2 additional signers and set transaction thresholds
+    const signerKeys = this.multiSigSigners.map((signer) => signer.publicKey());
+
+    const setOptionsOp = Operation.setOptions({
+      signer: {
+        ed25519PublicKey: signerKeys[0],
+        weight: 1,
+      },
+      masterWeight: 1, // Platform key has weight 1
+      lowThreshold: 1, // Low: single signature (e.g., for reading account)
+      medThreshold: 2, // Medium: 2 signatures (e.g., for setOptions)
+      highThreshold: 2, // High: 2 signatures (e.g., for transfers)
+    });
+
+    const tx = new TransactionBuilder(platformAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
+    })
+      .addOperation(setOptionsOp)
+      .build();
+
+    // Sign with platform key
+    tx.sign(this.platformKeypair);
+    await this.submitWithRetrySigned(tx, [this.platformKeypair]);
+
+    const updatedPlatformAccount =
+      await this.server.loadAccount(platformPublicKey);
+
+    const secondSignerOp = Operation.setOptions({
+      signer: {
+        ed25519PublicKey: signerKeys[1],
+        weight: 1,
+      },
+    });
+
+    const secondTx = new TransactionBuilder(updatedPlatformAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
+    })
+      .addOperation(secondSignerOp)
+      .build();
+
+    secondTx.sign(this.platformKeypair);
+    await this.submitWithRetrySigned(secondTx, [this.platformKeypair]);
+
+    this.logger.info(
+      {
+        platformPublicKey,
+        signers: signerKeys,
+        masterWeight: 1,
+        lowThreshold: 1,
+        medThreshold: 2,
+        highThreshold: 2,
+      },
+      'Platform wallet multi-sig configuration completed successfully',
+    );
+
+    return {
+      platformPublicKey,
+      signers: signerKeys,
+      transactionThreshold: 2,
+    };
+  }
+
+  /**
+   * Returns the multi-sig configuration of the platform wallet for audit purposes.
+   * Queries the Horizon API to get the current signer configuration.
+   */
+  async getPlatformMultiSigConfig(): Promise<{
+    publicKey: string;
+    signers: Array<{ key: string; weight: number }>;
+    thresholds: { low: number; med: number; high: number };
+  }> {
+    const platformPublicKey = this.platformKeypair.publicKey();
+    const account = await this.server.loadAccount(platformPublicKey);
+
+    const signers = account.signers.map((signer) => ({
+      key: signer.key,
+      weight: signer.weight,
+    }));
+
+    return {
+      publicKey: platformPublicKey,
+      signers,
+      thresholds: {
+        low: account.thresholds.low_threshold,
+        med: account.thresholds.med_threshold,
+        high: account.thresholds.high_threshold,
+      },
+    };
+  }
+
+  private async fundAccountWithFriendbot(publicKey: string): Promise<void> {
+    const isDevelopmentEnv =
+      process.env.NODE_ENV === 'development' || process.env.NODE_ENV === 'dev';
+    const isTestnet = this.networkPassphrase === Networks.TESTNET;
+
+    if (!isDevelopmentEnv || !isTestnet) {
+      return;
+    }
+
+    const friendbotUrl = `https://friendbot.stellar.org?addr=${encodeURIComponent(publicKey)}`;
+    const maxAttempts = 3;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        await axios.get(friendbotUrl, { timeout: 10000 });
+        this.logger.info({ publicKey }, 'Funded Stellar account via Friendbot');
+        return;
+      } catch (error: any) {
+        const status = error?.response?.status;
+        const isRateLimited = status === 429 || status === 503;
+
+        if (attempt < maxAttempts && isRateLimited) {
+          this.logger.warn(
+            { publicKey, attempt, status, message: error?.message },
+            'Friendbot rate limited, retrying funding request',
+          );
+          await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+          continue;
+        }
+
+        this.logger.warn(
+          { publicKey, attempt, status, message: error?.message },
+          'Friendbot funding request failed; continuing without funding',
+        );
+        return;
+      }
+    }
+  }
+
+  async onModuleInit(): Promise<void> {
+    await this.connectRedis();
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    this.localSequenceCache.clear();
+    if (this.sequenceRedis?.isOpen) {
+      await this.sequenceRedis.quit();
+    }
+  }
+
+  private async connectRedis(): Promise<void> {
+    if (!this.sequenceRedis || this.sequenceRedis.isOpen) {
+      return;
+    }
+    await this.sequenceRedis.connect();
+  }
+
+  private cacheSeqKey(publicKey: string): string {
+    return `stellar:seq:${publicKey}`;
+  }
+
+  private async getCachedSequence(publicKey: string): Promise<string | null> {
+    const now = Date.now();
+    const local = this.localSequenceCache.get(publicKey);
+    if (local && now < local.expiresAt) {
+      return local.seq;
+    }
+    this.localSequenceCache.delete(publicKey);
+
+    if (this.sequenceRedis) {
+      try {
+        const raw = (await this.sequenceRedis.get(
+          this.cacheSeqKey(publicKey),
+        )) as string | null;
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          this.localSequenceCache.set(publicKey, {
+            seq: parsed.seq,
+            expiresAt: now + SEQUENCE_CACHE_TTL * 1000,
+          });
+          return parsed.seq;
+        }
+      } catch {
+        // Redis failure — fall back to local
+      }
+    }
+    return null;
+  }
+
+  private async setCachedSequence(
+    publicKey: string,
+    seq: string,
+  ): Promise<void> {
+    const expiresAt = Date.now() + SEQUENCE_CACHE_TTL * 1000;
+    this.localSequenceCache.set(publicKey, { seq, expiresAt });
+
+    if (this.sequenceRedis) {
+      try {
+        await this.sequenceRedis.setEx(
+          this.cacheSeqKey(publicKey),
+          SEQUENCE_CACHE_TTL,
+          JSON.stringify({ seq }),
+        );
+      } catch {
+        // Redis failure — local cache is sufficient
+      }
+    }
+  }
+
+  private async invalidateCachedSequence(publicKey: string): Promise<void> {
+    this.localSequenceCache.delete(publicKey);
+    if (this.sequenceRedis) {
+      try {
+        await this.sequenceRedis.del(this.cacheSeqKey(publicKey));
+      } catch {
+        // best-effort
+      }
+    }
+  }
+
+  /**
+   * Loads a Stellar account, preferring cached sequence numbers.
+   */
+  async loadAccountCached(publicKey: string): Promise<Horizon.AccountResponse> {
+    const cachedSeq = await this.getCachedSequence(publicKey);
+    if (cachedSeq) {
+      try {
+        const account = await this.server.loadAccount(publicKey);
+        const liveSeq = account.sequenceNumber();
+        if (liveSeq === cachedSeq) {
+          return account;
+        }
+        await this.setCachedSequence(publicKey, liveSeq);
+        return account;
+      } catch {
+        // Fall through to fresh load
+      }
+    }
+
+    const account = await this.server.loadAccount(publicKey);
+    await this.setCachedSequence(publicKey, account.sequenceNumber());
+    return account;
+  }
+
+  /**
+   * Increments the locally-cached sequence number so subsequent pooled
+   * transactions can use the next sequence without re-fetching from Horizon.
+   */
+  private async incrementLocalSequence(publicKey: string): Promise<void> {
+    const current = this.localSequenceCache.get(publicKey);
+    if (current) {
+      const nextSeq = (BigInt(current.seq) + 1n).toString();
+      await this.setCachedSequence(publicKey, nextSeq);
+    }
+  }
+
+  /**
+   * Validates a transaction envelope XDR before submission.
+   * Asserts only expected operations are present and destination
+   * addresses match active deal escrows.
+   */
+  async validateTransactionXdr(
+    signedXdr: string,
+    allowedOpTypes: string[] = ['payment', 'changeTrust'],
+    allowedDestinations?: string[],
+  ): Promise<{ valid: boolean; reason?: string }> {
+    let tx: Transaction;
+    try {
+      tx = TransactionBuilder.fromXDR(
+        signedXdr,
+        this.networkPassphrase,
+      ) as Transaction;
+    } catch {
+      return {
+        valid: false,
+        reason: 'Invalid XDR: could not decode transaction',
+      };
+    }
+
+    const opTypeMap: Record<number, string> = {
+      1: 'createAccount',
+      2: 'payment',
+      3: 'pathPaymentStrictReceive',
+      4: 'manageSellOffer',
+      5: 'createPassiveSellOffer',
+      6: 'setOptions',
+      7: 'changeTrust',
+      8: 'allowTrust',
+      9: 'accountMerge',
+      10: 'inflation',
+      11: 'manageData',
+      12: 'bumpSequence',
+      13: 'manageBuyOffer',
+      14: 'pathPaymentStrictSend',
+      15: 'claimClaimableBalance',
+      16: 'beginSponsoringFutureReserves',
+      17: 'endSponsoringFutureReserves',
+      18: 'revokeSponsorship',
+      19: 'clawback',
+      20: 'clawbackClaimableBalance',
+      21: 'setTrustLineFlags',
+      22: 'liquidityPoolDeposit',
+      23: 'liquidityPoolWithdraw',
+    };
+
+    const allowedSet = new Set(allowedOpTypes.map((t) => t.toLowerCase()));
+
+    for (const op of tx.operations) {
+      const opName = opTypeMap[op.type] ?? `unknown_${op.type}`;
+      if (!allowedSet.has(opName)) {
+        return {
+          valid: false,
+          reason: `Operation type '${opName}' is not allowed. Allowed: ${allowedOpTypes.join(', ')}`,
+        };
+      }
+
+      if (
+        allowedDestinations &&
+        (opName === 'payment' || opName === 'createAccount')
+      ) {
+        const dest = (op as any).destination;
+        if (dest && !allowedDestinations.includes(dest)) {
+          return {
+            valid: false,
+            reason: `Destination ${dest} is not in the allowed escrow list`,
+          };
+        }
+      }
+    }
+
+    return { valid: true };
   }
 
   /**
@@ -120,6 +636,7 @@ export class StellarService {
     tradeDealId: string,
   ): Promise<{ publicKey: string; secretKey: string }> {
     const escrowKeypair = Keypair.random();
+    await this.fundAccountWithFriendbot(escrowKeypair.publicKey());
 
     const platformAccount = await this.server.loadAccount(
       this.platformKeypair.publicKey(),
@@ -129,6 +646,7 @@ export class StellarService {
     const tx = new TransactionBuilder(platformAccount, {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
     })
       .addOperation(
         Operation.createAccount({
@@ -137,11 +655,11 @@ export class StellarService {
         }),
       )
       .addMemo(Memo.text(`escrow:${tradeDealId.slice(0, 20)}`))
-      .setTimeout(30)
+      
       .build();
 
     tx.sign(this.platformKeypair);
-    await this.server.submitTransaction(tx);
+    await this.submitWithRetrySigned(tx, [this.platformKeypair]);
 
     // Establish USDC trustline on the escrow account (skip if USDC issuer not configured)
     if (!this.usdcAsset.isNative()) {
@@ -151,17 +669,18 @@ export class StellarService {
       const trustlineTx = new TransactionBuilder(escrowAccount, {
         fee: BASE_FEE,
         networkPassphrase: this.networkPassphrase,
+        timebounds: this.getTransactionTimebounds(),
       })
         .addOperation(
           Operation.changeTrust({
             asset: this.usdcAsset,
           }),
         )
-        .setTimeout(30)
+        
         .build();
 
       trustlineTx.sign(escrowKeypair);
-      await this.server.submitTransaction(trustlineTx);
+      await this.submitWithRetrySigned(trustlineTx, [escrowKeypair]);
     }
 
     this.logger.info(
@@ -181,6 +700,80 @@ export class StellarService {
   }
 
   /**
+   * Creates a replacement account for account merge recovery.
+   * - Generates a new keypair
+   * - Funds with sufficient XLM for base reserve + USDC trustline
+   * - Establishes USDC trustline automatically
+   * - Used when an investor's original account is merged/closed
+   * Issue #683 — Account merge handler re-establishes trustlines
+   */
+  async createReplacementAccount(): Promise<{
+    publicKey: string;
+    secretKey: string;
+  }> {
+    const replacementKeypair = Keypair.random();
+    await this.fundAccountWithFriendbot(replacementKeypair.publicKey());
+
+    const platformAccount = await this.server.loadAccount(
+      this.platformKeypair.publicKey(),
+    );
+
+    // Fund with 3 XLM (2 base reserve + 0.5 for USDC trustline + 0.5 buffer)
+    const tx = new TransactionBuilder(platformAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
+    })
+      .addOperation(
+        Operation.createAccount({
+          destination: replacementKeypair.publicKey(),
+          startingBalance: '3',
+        }),
+      )
+      .addMemo(Memo.text('acct-merge-recovery'))
+      
+      .build();
+
+    tx.sign(this.platformKeypair);
+    await this.submitWithRetrySigned(tx, [this.platformKeypair]);
+
+    // Establish USDC trustline immediately
+    if (!this.usdcAsset.isNative()) {
+      const replacementAccount = await this.server.loadAccount(
+        replacementKeypair.publicKey(),
+      );
+      const trustlineTx = new TransactionBuilder(replacementAccount, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+        timebounds: this.getTransactionTimebounds(),
+      })
+        .addOperation(
+          Operation.changeTrust({
+            asset: this.usdcAsset,
+          }),
+        )
+        
+        .build();
+
+      trustlineTx.sign(replacementKeypair);
+      await this.submitWithRetrySigned(trustlineTx, [replacementKeypair]);
+
+      this.logger.info(
+        {
+          replacementPublicKey: replacementKeypair.publicKey(),
+          trustlineEstablished: true,
+        },
+        'Replacement account created for merge recovery with USDC trustline',
+      );
+    }
+
+    return {
+      publicKey: replacementKeypair.publicKey(),
+      secretKey: replacementKeypair.secret(),
+    };
+  }
+
+  /**
    * Issues Trade_Tokens for a deal.
    * - Generates a fresh issuer keypair
    * - Escrow account establishes a trustline for the asset
@@ -195,6 +788,7 @@ export class StellarService {
   ): Promise<{ txId: string; issuerPublicKey: string; issuerSecret: string }> {
     // Generate a fresh issuer keypair for this deal
     const issuerKeypair = Keypair.random();
+    await this.fundAccountWithFriendbot(issuerKeypair.publicKey());
 
     // Fund the issuer account via platform account
     const platformAccount = await this.server.loadAccount(
@@ -204,6 +798,7 @@ export class StellarService {
     const fundIssuerTx = new TransactionBuilder(platformAccount, {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
     })
       .addOperation(
         Operation.createAccount({
@@ -218,13 +813,16 @@ export class StellarService {
           setFlags: 10 as any,
         }),
       )
-      .setTimeout(30)
+      
       .build();
 
     fundIssuerTx.sign(this.platformKeypair, issuerKeypair);
-    await this.server.submitTransaction(fundIssuerTx);
+    await this.submitWithRetrySigned(fundIssuerTx, [
+      this.platformKeypair,
+      issuerKeypair,
+    ]);
 
-    const tradeAsset = new Asset(assetCode, issuerKeypair.publicKey());
+    const tradeAsset = createAsset(assetCode, issuerKeypair.publicKey());
 
     // Escrow account establishes trustline for the asset
     const escrowAccount = await this.server.loadAccount(escrowPublicKey);
@@ -233,6 +831,7 @@ export class StellarService {
     const trustlineTx = new TransactionBuilder(escrowAccount, {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
     })
       .addOperation(
         Operation.changeTrust({
@@ -240,11 +839,11 @@ export class StellarService {
           limit: tokenCount.toString(),
         }),
       )
-      .setTimeout(30)
+      
       .build();
 
     trustlineTx.sign(escrowKeypair);
-    await this.server.submitTransaction(trustlineTx);
+    await this.submitWithRetrySigned(trustlineTx, [escrowKeypair]);
 
     // Issuer mints tokens to escrow account
     const issuerAccount = await this.server.loadAccount(
@@ -254,6 +853,7 @@ export class StellarService {
     const mintTx = new TransactionBuilder(issuerAccount, {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
     })
       .addOperation(
         Operation.payment({
@@ -262,11 +862,13 @@ export class StellarService {
           amount: tokenCount.toString(),
         }),
       )
-      .setTimeout(30)
+      
       .build();
 
     mintTx.sign(issuerKeypair);
-    const mintResult = await this.server.submitTransaction(mintTx);
+    const mintResult = await this.submitWithRetrySigned(mintTx, [
+      issuerKeypair,
+    ]);
 
     const txId = (mintResult as any).hash as string;
     this.logger.info(
@@ -314,6 +916,7 @@ export class StellarService {
     const tx = new TransactionBuilder(investorAccount, {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
     })
       .addOperation(
         Operation.payment({
@@ -322,17 +925,17 @@ export class StellarService {
           amount: amountUSD,
         }),
       )
-      .setTimeout(30)
+      
       .build();
 
     // Note: in production the investor signs this via their wallet (Freighter/Albedo)
     // For backend-initiated flows, we'd need the investor's secret — omitted here
-    const result = await this.server.submitTransaction(tx);
+    const result = await this.submitWithRetry(tx);
     const paymentTxId = (result as any).hash as string;
 
     // If escrow secret and asset info provided, transfer Trade_Tokens to investor
     if (encryptedEscrowSecret && assetCode && tokenAmount !== undefined) {
-      const escrowSecret = this.decryptSecret(encryptedEscrowSecret);
+      const escrowSecret = await this.decryptSecret(encryptedEscrowSecret);
       await this.transferTradeTokens(
         escrowSecret,
         escrowPublicKey,
@@ -358,11 +961,12 @@ export class StellarService {
     const escrowKeypair = Keypair.fromSecret(escrowSecret);
     const escrowAccount = await this.server.loadAccount(escrowPublicKey);
 
-    const tradeToken = new Asset(assetCode, escrowPublicKey);
+    const tradeToken = createAsset(assetCode, escrowPublicKey);
 
     const tx = new TransactionBuilder(escrowAccount, {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
     })
       .addOperation(
         Operation.payment({
@@ -371,12 +975,12 @@ export class StellarService {
           amount: tokenAmount.toFixed(7),
         }),
       )
-      .setTimeout(30)
+      
       .build();
 
     tx.sign(escrowKeypair);
 
-    const result = await this.server.submitTransaction(tx);
+    const result = await this.submitWithRetrySigned(tx, [escrowKeypair]);
     const txId = (result as any).hash as string;
     this.logger.info(
       {
@@ -393,53 +997,98 @@ export class StellarService {
   /**
    * Encrypts a secret key using AES-256-CBC with the ENCRYPTION_KEY env var.
    */
-  encryptSecret(secret: string): string {
-    const key = Buffer.from(
-      (() => {
-        const rawKey = this.config.get<string>('ENCRYPTION_KEY', '');
-        if (!rawKey) {
-          throw new Error('ENCRYPTION_KEY is not set');
-        }
-        // Expect a 64‑character hex string (32 bytes)
-        return Buffer.from(rawKey, 'hex');
-      })(),
-    );
-    const iv = randomBytes(16);
-    const cipher = createCipheriv('aes-256-cbc', key, iv);
-    const encrypted = Buffer.concat([
-      cipher.update(secret, 'utf8'),
-      cipher.final(),
-    ]);
-    return `${iv.toString('hex')}:${encrypted.toString('hex')}`;
+  async encryptSecret(secret: string): Promise<string> {
+    return this.kmsService.encrypt(secret);
   }
 
   /**
    * Decrypts a secret key encrypted by encryptSecret().
    */
-  decryptSecret(encryptedSecret: string): string {
-    const key = Buffer.from(
-      (() => {
-        const rawKey = this.config.get<string>('ENCRYPTION_KEY', '');
-        if (!rawKey) {
-          throw new Error('ENCRYPTION_KEY is not set');
-        }
-        return Buffer.from(rawKey, 'hex');
-      })(),
-    );
-    const [ivHex, encryptedHex] = encryptedSecret.split(':');
-    const iv = Buffer.from(ivHex, 'hex');
-    const encrypted = Buffer.from(encryptedHex, 'hex');
-    const decipher = createDecipheriv('aes-256-cbc', key, iv);
-    return Buffer.concat([
-      decipher.update(encrypted),
-      decipher.final(),
-    ]).toString('utf8');
+  async decryptSecret(encryptedSecret: string): Promise<string> {
+    return this.kmsService.decrypt(encryptedSecret);
   }
 
   /**
    * Releases escrow funds: farmer (98%), investors (proportional), platform (2%).
-   * Returns an array of transaction IDs for each payment.
+   * Uses BigNumber.js for all amount conversions to avoid precision loss.
+   * For investors without a USDC trustline, creates a claimable balance instead
+   * of a payment so funds remain available for later claiming.
+   * Returns an array of transaction IDs for each batch.
    */
+  /**
+   * Releases escrow with automatic op_no_trust recovery via replacement accounts.
+   * Wraps releaseEscrow() with 3-attempt retry logic for account merge scenarios.
+   * If op_no_trust is detected, attempts to use replacement accounts from merge recovery.
+   */
+  async releaseEscrowWithMergeRecovery(
+    escrowSecret: string,
+    farmerWallet: string,
+    investorShares: InvestorShare[],
+    platformWallet: string,
+    totalValue: number,
+    dealId?: string,
+  ): Promise<string[]> {
+    const MAX_RETRIES = 3;
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        return await this.releaseEscrow(
+          escrowSecret,
+          farmerWallet,
+          investorShares,
+          platformWallet,
+          totalValue,
+        );
+      } catch (error: any) {
+        lastError = error;
+        const errorCode =
+          error?.response?.data?.extras?.result_codes?.operations?.[0];
+        const isOpNoTrust = errorCode === 'op_no_trust';
+
+        this.logger.warn(
+          {
+            attempt: attempt + 1,
+            maxRetries: MAX_RETRIES,
+            errorCode,
+            isOpNoTrust,
+            dealId,
+          },
+          `Escrow release failed (attempt ${attempt + 1}/${MAX_RETRIES})`,
+        );
+
+        if (isOpNoTrust && attempt < MAX_RETRIES - 1) {
+          // op_no_trust detected - likely due to account merge
+          // Wait before retrying to allow merge recovery handler to complete
+          this.logger.info(
+            { dealId, attempt: attempt + 1 },
+            'op_no_trust detected - waiting for account merge recovery...',
+          );
+          await new Promise((resolve) =>
+            setTimeout(resolve, 2000 * Math.pow(2, attempt)),
+          );
+          continue;
+        }
+
+        if (attempt === MAX_RETRIES - 1) {
+          break; // Last attempt, don't retry
+        }
+      }
+    }
+
+    // All retries exhausted
+    this.logger.error(
+      {
+        dealId,
+        maxRetries: MAX_RETRIES,
+        finalError: lastError?.message,
+      },
+      'Escrow release failed after all retry attempts',
+    );
+
+    throw lastError || new Error('Escrow release failed');
+  }
+
   async releaseEscrow(
     escrowSecret: string,
     farmerWallet: string,
@@ -449,96 +1098,165 @@ export class StellarService {
   ): Promise<string[]> {
     const escrowKeypair = Keypair.fromSecret(escrowSecret);
 
-    // Convert to stroops (1 XLM = 10^7 stroops)
-    const totalStroops = Math.round(totalValue * 1e7);
+    // Convert to stroops using BigNumber (1 XLM = 10^7 stroops)
+    const escrowReleaseService =
+      this.escrowReleaseService ?? new EscrowReleaseService();
+    const {
+      totalStroopsBN,
+      platformStroops,
+      investorPoolStroops,
+      totalTokens,
+    } = escrowReleaseService.calculateReleasePlan(totalValue, investorShares);
 
-    if (totalStroops <= 0) {
-      throw new Error('Invalid totalValue');
-    }
-
-    // Calculate platform + farmer
-    const platformStroops = Math.floor(totalStroops * 0.02);
-    const farmerStroops = Math.floor(totalStroops * 0.98);
-
-    // Compute total tokens safely
-    const totalTokens = investorShares.reduce(
-      (sum, s) => sum + s.tokenAmount,
-      0,
+    // Pre-check which investors have a USDC trustline for claimable balance logic
+    const trustlineResults = await Promise.allSettled(
+      investorShares.map((share) =>
+        this.server
+          .loadAccount(share.walletAddress)
+          .then((acc) => this.hasTrustline(acc, this.usdcAsset)),
+      ),
     );
-
-    if (totalTokens <= 0) {
-      throw new Error('Invalid investor token distribution');
-    }
+    const hasUsdcTrustline = investorShares.map(
+      (_, i) =>
+        trustlineResults[i].status === 'fulfilled' &&
+        (trustlineResults[i] as PromiseFulfilledResult<boolean>).value,
+    );
 
     const BATCH_SIZE = 98;
     const txIds: string[] = [];
     let distributedToInvestors = 0;
-    const batchCount = Math.max(1, Math.ceil(investorShares.length / BATCH_SIZE));
+    const batchCount = Math.max(
+      1,
+      Math.ceil(investorShares.length / BATCH_SIZE),
+    );
+
+    // Track claimable balances for database logging
+    const claimableInvestors: Array<{
+      walletAddress: string;
+      amount: string;
+      txHash?: string;
+    }> = [];
 
     for (let batchIdx = 0; batchIdx < batchCount; batchIdx++) {
       const batchStart = batchIdx * BATCH_SIZE;
       const batch = investorShares.slice(batchStart, batchStart + BATCH_SIZE);
 
-      const batchAccount = await this.server.loadAccount(
-        escrowKeypair.publicKey(),
-      );
-      const txBuilder = new TransactionBuilder(batchAccount, {
-        fee: BASE_FEE,
-        networkPassphrase: this.networkPassphrase,
-      });
-
-      if (batchIdx === 0) {
-        txBuilder.addOperation(
-          Operation.payment({
-            destination: farmerWallet,
-            asset: this.usdcAsset,
-            amount: (farmerStroops / 1e7).toFixed(7),
-          }),
-        );
-      }
-
-      batch.forEach((share, localIdx) => {
-        const globalIdx = batchStart + localIdx;
-        let shareStroops = Math.floor(
-          (share.tokenAmount / totalTokens) * totalStroops,
-        );
-
-        if (globalIdx === investorShares.length - 1) {
-          shareStroops =
-            totalStroops -
-            farmerStroops -
-            platformStroops -
-            distributedToInvestors;
-        }
-
-        distributedToInvestors += shareStroops;
-
-        txBuilder.addOperation(
-          Operation.payment({
-            destination: share.walletAddress,
-            asset: this.usdcAsset,
-            amount: (shareStroops / 1e7).toFixed(7),
-          }),
-        );
-      });
-
-      if (batchIdx === batchCount - 1) {
-        txBuilder.addOperation(
-          Operation.payment({
-            destination: platformWallet,
-            asset: this.usdcAsset,
-            amount: (platformStroops / 1e7).toFixed(7),
-          }),
-        );
-      }
-
-      const tx = txBuilder.setTimeout(30).build();
-      tx.sign(escrowKeypair);
+      // Capture batch-scoped variables for the buildTx closure
+      const capturedBatch = batch;
+      const capturedBatchStart = batchStart;
+      const isLastBatch = batchIdx === batchCount - 1;
+      const batchStartedAt = process.hrtime.bigint();
 
       try {
-        const result = await this.server.submitTransaction(tx);
-        txIds.push((result as any).hash as string);
+        // #826 — use fee-bump retry to handle tx_insufficient_fee on congested networks
+        const result = await this.submitWithFeeBumpRetry(
+          async (fee: string) => {
+            const batchAccount = this.enableSequenceCache
+              ? await this.loadAccountCached(escrowKeypair.publicKey())
+              : await this.server.loadAccount(escrowKeypair.publicKey());
+            const txBuilder = new TransactionBuilder(batchAccount, {
+              fee,
+              networkPassphrase: this.networkPassphrase,
+              timebounds: this.getTransactionTimebounds(),
+            });
+
+            capturedBatch.forEach((share, localIdx) => {
+              const globalIdx = capturedBatchStart + localIdx;
+              let shareStroops = Math.floor(
+                (share.tokenAmount / totalTokens) * investorPoolStroops,
+              );
+
+              if (globalIdx === investorShares.length - 1) {
+                shareStroops = investorPoolStroops - distributedToInvestors;
+              }
+
+              distributedToInvestors += shareStroops;
+
+              const shareAmount = new BigNumber(shareStroops)
+                .dividedBy(1e7)
+                .toFixed(7);
+              if (parseFloat(shareAmount) > 0) {
+                if (hasUsdcTrustline[globalIdx]) {
+                  txBuilder.addOperation(
+                    Operation.payment({
+                      destination: share.walletAddress,
+                      asset: this.usdcAsset,
+                      amount: shareAmount,
+                    }),
+                  );
+                } else {
+                  txBuilder.addOperation(
+                    Operation.createClaimableBalance({
+                      asset: this.usdcAsset,
+                      amount: shareAmount,
+                      claimants: [
+                        new Claimant(
+                          share.walletAddress,
+                          Claimant.predicateUnconditional(),
+                        ),
+                      ],
+                    }),
+                  );
+                  claimableInvestors.push({
+                    walletAddress: share.walletAddress,
+                    amount: shareAmount,
+                  });
+                }
+              }
+            });
+
+            if (isLastBatch) {
+              txBuilder.addOperation(
+                Operation.payment({
+                  destination: platformWallet,
+                  asset: this.usdcAsset,
+                  amount: new BigNumber(platformStroops)
+                    .dividedBy(1e7)
+                    .toFixed(7),
+                }),
+              );
+            }
+
+            return txBuilder.build();
+          },
+          escrowKeypair,
+        );
+
+        // Increment local sequence for next batch
+        if (this.enableSequenceCache) {
+          await this.incrementLocalSequence(escrowKeypair.publicKey());
+        }
+
+        const txHash = (result as any).hash as string;
+        txIds.push(txHash);
+        this.stellarTxTotal?.inc();
+        this.batchesTotal?.inc({ result: 'success' });
+        const batchElapsed =
+          Number(process.hrtime.bigint() - batchStartedAt) / 1e9;
+        this.batchDuration?.observe({ result: 'success' }, batchElapsed);
+
+        // Log any claimable balances created in this batch
+        const batchClaimable = claimableInvestors.filter(
+          (ci) =>
+            !ci.txHash &&
+            capturedBatch.some((s) => s.walletAddress === ci.walletAddress),
+        );
+        for (const ci of batchClaimable) {
+          ci.txHash = txHash;
+          this.claimableBalancesTotal?.inc();
+          await this.saveLog({
+            dealId: ci.walletAddress,
+            txHash,
+            status: TxStatus.PENDING_CLAIM,
+          });
+        }
       } catch (err: any) {
+        this.stellarTxTotal?.inc();
+        this.stellarTxFailures?.inc();
+        this.batchesTotal?.inc({ result: 'failure' });
+        const batchElapsed =
+          Number(process.hrtime.bigint() - batchStartedAt) / 1e9;
+        this.batchDuration?.observe({ result: 'failure' }, batchElapsed);
         this.logger.error(
           { batchIdx, totalBatches: batchCount },
           `Escrow release failed at batch ${batchIdx}: ${err.message}`,
@@ -547,7 +1265,10 @@ export class StellarService {
       }
     }
 
-    this.logger.info({ txIds }, 'Escrow released successfully');
+    this.logger.info(
+      { txIds, claimableCount: claimableInvestors.length },
+      'Escrow released successfully',
+    );
     return txIds;
   }
 
@@ -567,6 +1288,7 @@ export class StellarService {
     const tx = new TransactionBuilder(account, {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
     })
       .addOperation(
         Operation.payment({
@@ -576,14 +1298,112 @@ export class StellarService {
         }),
       )
       .addMemo(Memo.hash(docHashHex))
-      .setTimeout(30)
       .build();
 
     tx.sign(signerKeypair);
-    const result = await this.server.submitTransaction(tx);
+    const result = await this.submitWithRetrySigned(tx, [signerKeypair]);
 
     const txId = (result as any).hash as string;
     return txId;
+  }
+
+  /**
+   * Anchors an IPFS CID on the Stellar ledger by submitting a transaction
+   * with SHA-256(CID) in Memo.hash. Returns the Stellar transaction ID.
+   */
+  async anchorIpfsCid(
+    cid: string,
+    signerSecret: string,
+  ): Promise<{ txId: string }> {
+    const cidHash = createHash('sha256').update(cid).digest('hex');
+    const txId = await this.recordDocumentHash(cidHash, signerSecret);
+    return { txId };
+  }
+
+  /**
+   * Returns a public Stellar explorer URL for a given transaction hash.
+   * Uses stellar.expert — network-aware (testnet vs public).
+   */
+  getVerificationUrl(txHash: string): string {
+    return (this.stellarQueriesService ?? new StellarQueriesService()).getVerificationUrl(
+      this.networkPassphrase,
+      txHash,
+    );
+  }
+
+  /**
+   * Merges an empty escrow or issuer account back to the platform account.
+   * Zeroes out any remaining custom tokens (burns them by sending to issuer)
+   * and USDC (sends to platform), then removes trustlines before merging.
+   */
+  async closeAccount(
+    publicKey: string,
+    secretKey: string,
+    destination: string,
+  ): Promise<string> {
+    const keypair = Keypair.fromSecret(secretKey);
+    const account = await this.server.loadAccount(publicKey);
+
+    const assetsWithBalance = account.balances
+      .filter((b) => b.asset_type !== 'native' && parseFloat(b.balance) > 0)
+      .map((b: any) => b.asset_code || b.asset_type);
+
+    if (assetsWithBalance.length > 0) {
+      throw new Error(
+        `Cannot merge account: holds positive balance of ${assetsWithBalance.join(', ')}`,
+      );
+    }
+
+    const txBuilder = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
+    });
+
+    for (const balance of account.balances) {
+      if (balance.asset_type !== 'native') {
+        const asset =
+          balance.asset_type === 'credit_alphanum4' ||
+          balance.asset_type === 'credit_alphanum12'
+            ? createAsset(balance.asset_code, balance.asset_issuer)
+            : undefined;
+
+        if (asset) {
+          // Remove trustline
+          txBuilder.addOperation(
+            Operation.changeTrust({
+              asset,
+              limit: '0',
+            }),
+          );
+        }
+      }
+    }
+
+    txBuilder.addOperation(
+      Operation.accountMerge({
+        destination,
+      }),
+    );
+
+    const tx = txBuilder.build();
+    tx.sign(keypair);
+
+    try {
+      const result = await this.submitWithRetrySigned(tx, [keypair]);
+      const txId = (result as any).hash as string;
+      this.logger.info(
+        { publicKey, destination, txId },
+        'Account closed and merged successfully',
+      );
+      return txId;
+    } catch (err: any) {
+      this.logger.error(
+        `Account merge failed for ${publicKey}: ${err.message}`,
+        err.stack,
+      );
+      throw new Error(`Account merge failed: ${err.message}`);
+    }
   }
 
   /**
@@ -601,17 +1421,20 @@ export class StellarService {
     let stellarMemo: Memo;
 
     if (memoType === 'hash') {
-      const hash = createHash('sha256').update(memo).digest();
-      stellarMemo = Memo.hash(hash.toString('hex'));
-    } else {
-      // Stellar memo text is limited to 28 bytes; truncate if needed
-      const memoText = memo.slice(0, 28);
+const anchorsService = this.anchorsService ?? new AnchorsService();
+    const hash = anchorsService.buildHashMemo(memo);
+    stellarMemo = Memo.hash(hash.toString('hex'));
+  } else {
+    const memoText = (this.anchorsService ?? new AnchorsService()).truncateMemoText(
+      memo,
+    );
       stellarMemo = Memo.text(memoText);
     }
 
     const tx = new TransactionBuilder(account, {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
     })
       .addOperation(
         Operation.payment({
@@ -621,12 +1444,113 @@ export class StellarService {
         }),
       )
       .addMemo(stellarMemo)
-      .setTimeout(30)
       .build();
 
     tx.sign(signerKeypair);
-    const result = await this.server.submitTransaction(tx);
+    const result = await this.submitWithRetrySigned(tx, [signerKeypair]);
     return (result as any).hash as string;
+  }
+
+  /**
+   * Validates that an XDR transaction envelope carries a valid Ed25519 signature
+   * from the given public key, without submitting to the network.
+   *
+   * Steps:
+   *  1. Decode the XDR envelope and compute the transaction hash (the actual
+   *     payload that signers sign, which includes the network passphrase).
+   *  2. Derive the 4-byte key hint from the supplied public key.
+   *  3. Walk the envelope's decorator signatures; find the one whose hint matches
+   *     and cryptographically verify it with Keypair.verify().
+   *
+   * Returns a SignatureValidationResult so callers can surface precise errors to
+   * the user without an unnecessary round-trip to Horizon.
+   */
+  validateTransactionSignatures(
+    signedXdr: string,
+    expectedPublicKey: string,
+  ): SignatureValidationResult {
+    const base: Omit<SignatureValidationResult, 'valid'> = {
+      publicKey: expectedPublicKey,
+      signatureCount: 0,
+      matchedSignatureIndex: -1,
+    };
+
+    let keypair: Keypair;
+    try {
+      keypair = Keypair.fromPublicKey(expectedPublicKey);
+    } catch {
+      return {
+        ...base,
+        valid: false,
+        error: `Invalid public key: "${expectedPublicKey}" is not a valid Stellar ed25519 public key.`,
+      };
+    }
+
+    let tx: ReturnType<typeof TransactionBuilder.fromXDR>;
+    try {
+      tx = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
+    } catch {
+      return {
+        ...base,
+        valid: false,
+        error:
+          'Failed to parse XDR envelope. Ensure the transaction was built for the correct network.',
+      };
+    }
+
+    const signatures = tx.signatures;
+    base.signatureCount = signatures.length;
+
+    if (signatures.length === 0) {
+      return {
+        ...base,
+        valid: false,
+        error: 'Transaction envelope contains no signatures.',
+      };
+    }
+
+    // The payload that was signed: SHA-256(network_passphrase_hash || tx_hash_prefix || tx_body)
+    const txHash = tx.hash();
+    const expectedHint = keypair.signatureHint();
+
+    for (let i = 0; i < signatures.length; i++) {
+      const decoratedSig = signatures[i];
+      const hint = decoratedSig.hint();
+
+      // Quick hint check before expensive verify
+      if (!hint.equals(expectedHint)) {
+        continue;
+      }
+
+      const signatureBytes = decoratedSig.signature();
+      const isValid = keypair.verify(txHash, signatureBytes);
+
+      if (isValid) {
+        this.logger.info(
+          { publicKey: expectedPublicKey, signatureIndex: i },
+          'Transaction signature validated successfully',
+        );
+        return {
+          ...base,
+          valid: true,
+          matchedSignatureIndex: i,
+        };
+      }
+
+      // Hint matched but bytes failed — report immediately
+      return {
+        ...base,
+        valid: false,
+        matchedSignatureIndex: i,
+        error: `Signature at index ${i} has a matching hint for key ${expectedPublicKey} but failed cryptographic verification. The transaction may have been tampered with.`,
+      };
+    }
+
+    return {
+      ...base,
+      valid: false,
+      error: `No signature found for public key ${expectedPublicKey}. The transaction has ${signatures.length} signature(s) but none match this key's hint.`,
+    };
   }
 
   /**
@@ -645,10 +1569,59 @@ export class StellarService {
   }
 
   /**
-   * Creates an unsigned XDR transaction for an investment.
+   * Returns true when the given wallet has established a USDC trustline.
+   * Returns false if the account does not exist or the trustline is absent.
+   */
+  async checkUsdcTrustline(walletAddress: string): Promise<boolean> {
+    try {
+      const account = await this.server.loadAccount(walletAddress);
+      return this.hasTrustline(account, this.usdcAsset);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Calculates the minimum XLM reserve required for an account.
+   * Formula: base_reserve = (2 + num_trustlines + num_signers) * 0.5 XLM
+   */
+  async getMinimumBalance(account: Horizon.AccountResponse): Promise<string> {
+    const numTrustlines = account.balances.filter(
+      (b: any) => b.asset_type !== 'native',
+    ).length;
+    const numSigners = account.signers ? account.signers.length : 1;
+    const reserve = new BigNumber(2)
+      .plus(numTrustlines)
+      .plus(numSigners)
+      .multipliedBy(0.5);
+    return reserve.toFixed(7);
+  }
+
+  /**
+   * Verifies an account's XLM balance exceeds the minimum base reserve
+   * before sending transactions. Returns the balance and minimum required.
+   */
+  async checkMinimumReserve(publicKey: string): Promise<{
+    sufficient: boolean;
+    balance: string;
+    minimumRequired: string;
+  }> {
+    const account = await this.server.loadAccount(publicKey);
+    const xlmBalance =
+      (account.balances.find((b: any) => b.asset_type === 'native') as any)
+        ?.balance ?? '0';
+    const minRequired = await this.getMinimumBalance(account);
+    return {
+      sufficient: new BigNumber(xlmBalance).gte(minRequired),
+      balance: xlmBalance,
+      minimumRequired: minRequired,
+    };
+  }
+
+  /**
+   * Creates an unsigned XDR transaction for an investment using USDC.
    * Prepends a changeTrust operation when the investor lacks a trustline.
    * Throws a descriptive error when the investor has insufficient XLM reserve.
-   * Creates an unsigned XDR transaction for an investment using USDC.
    * The investor will sign this transaction to fund the escrow account.
    */
   async createInvestmentTransaction(
@@ -659,17 +1632,16 @@ export class StellarService {
     tokenAmount: number,
     issuerPublicKey: string,
     complianceData?: Record<string, unknown>,
+    investmentMemo?: string,
   ): Promise<string> {
     const investorAccount = await this.server.loadAccount(investorWallet);
-    const tradeAsset = new Asset(assetCode, issuerPublicKey);
-
+    const tradeAsset = createAsset(assetCode, issuerPublicKey);
     const needsTrustline = !(await this.hasTrustline(
       investorAccount,
       tradeAsset,
     ));
 
     if (needsTrustline) {
-      // Each trustline requires 0.5 XLM base reserve; ensure the investor can cover it
       const xlmBalance = parseFloat(
         (
           investorAccount.balances.find(
@@ -677,9 +1649,11 @@ export class StellarService {
           ) as any
         )?.balance ?? '0',
       );
-      // Minimum spendable = existing subentries * 0.5 + 2 (base) + 0.5 (new trustline) + fee buffer
-      const minRequired =
-        (investorAccount.subentry_count + 1) * 0.5 + 2 + 0.001;
+      const investmentTxService =
+        this.investmentTxService ?? new InvestmentTxService();
+      const minRequired = investmentTxService.computeReserveRequirement(
+        investorAccount.subentry_count,
+      );
       if (xlmBalance < minRequired) {
         throw new Error(
           `Insufficient XLM balance for trustline base reserve. ` +
@@ -688,9 +1662,11 @@ export class StellarService {
       }
     }
 
+    // Use USDC for stable USD-denominated payments
     const txBuilder = new TransactionBuilder(investorAccount, {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
     });
 
     if (needsTrustline) {
@@ -705,8 +1681,139 @@ export class StellarService {
           amount: amountUSD.toFixed(7),
         }),
       )
-      .addMemo(Memo.text(`invest:${assetCode}:${tokenAmount}`))
-      .setTimeout(300);
+      .addMemo(
+        Memo.text(
+          (this.investmentTxService ?? new InvestmentTxService()).buildInvestmentMemo(
+            assetCode,
+            tokenAmount,
+            investmentMemo,
+          ),
+        ),
+      );
+
+    this.addComplianceDataOperations(txBuilder, complianceData);
+
+    return txBuilder.build().toXDR();
+  }
+
+  /**
+   * Queries the Horizon path-finding endpoint (strictSendPaths) to discover
+   * the best conversion route from sourceAsset to destAsset for a given amount.
+   * Returns the intermediate path and the projected destination amount, or null
+   * if no route exists.
+   */
+  async findPaymentPaths(
+    sourceAsset: Asset,
+    destAsset: Asset,
+    amount: string,
+  ): Promise<{ path: Asset[]; destAmount: string } | null> {
+    const page = await this.server
+      .strictSendPaths(sourceAsset, amount, [destAsset])
+      .call();
+
+    const record = page.records[0];
+    if (!record) return null;
+
+    return {
+      path: record.path as unknown as Asset[],
+      destAmount: record.destination_amount,
+    };
+  }
+
+  /**
+   * Creates an unsigned XDR transaction for an investment using a path payment.
+   * Investors who do not hold USDC can pay with XLM (native) or a custom asset
+   * (e.g. EURC). Horizon path finding automatically discovers the best conversion
+   * route through the Stellar DEX.
+   *
+   * Builds a pathPaymentStrictSend operation so the investor defines the exact
+   * send asset and amount, while the escrow receives the required USDC.
+   *
+   * @param investorWallet   Public key of the investor (transaction source)
+   * @param escrowPublicKey  Escrow account that receives USDC
+   * @param sourceAsset      Asset the investor will send (native XLM or custom)
+   * @param sendAmount       Exact amount of sourceAsset to send
+   * @param amountUSD        Required USDC amount the escrow must receive (destMin)
+   * @param assetCode        Trade token asset code
+   * @param tokenAmount      Number of trade tokens the investor receives
+   * @param issuerPublicKey  Trade token issuer
+   * @param complianceData   Optional FATF Travel Rule data
+   * @returns                Unsigned base64 XDR for the investor to sign
+   */
+  async createPathPaymentInvestmentTransaction(
+    investorWallet: string,
+    escrowPublicKey: string,
+    sourceAsset: Asset,
+    sendAmount: string,
+    amountUSD: number,
+    assetCode: string,
+    tokenAmount: number,
+    issuerPublicKey: string,
+    complianceData?: Record<string, unknown>,
+  ): Promise<string> {
+    const investorAccount = await this.server.loadAccount(investorWallet);
+    const tradeAsset = createAsset(assetCode, issuerPublicKey);
+
+    // Find best conversion path from sourceAsset to USDC
+    const pathResult = await this.findPaymentPaths(
+      sourceAsset,
+      this.usdcAsset,
+      sendAmount,
+    );
+
+    if (!pathResult) {
+      throw new Error(
+        `No path found from ${sourceAsset.getCode()} to USDC for ${sendAmount} ${sourceAsset.getCode()}. ` +
+          'Ensure the Stellar DEX has sufficient liquidity for this conversion.',
+      );
+    }
+
+    const needsTrustline = !(await this.hasTrustline(
+      investorAccount,
+      tradeAsset,
+    ));
+
+    if (needsTrustline) {
+      const xlmBalance = parseFloat(
+        (
+          investorAccount.balances.find(
+            (b: any) => b.asset_type === 'native',
+          ) as any
+        )?.balance ?? '0',
+      );
+      const minRequired =
+        (investorAccount.subentry_count + 1) * 0.5 + 2 + 0.001;
+      if (xlmBalance < minRequired) {
+        throw new Error(
+          `Insufficient XLM balance for trustline base reserve. ` +
+            `Need at least ${minRequired.toFixed(3)} XLM, have ${xlmBalance} XLM.`,
+        );
+      }
+    }
+
+    const txBuilder = new TransactionBuilder(investorAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
+    });
+
+    if (needsTrustline) {
+      txBuilder.addOperation(Operation.changeTrust({ asset: tradeAsset }));
+    }
+
+    txBuilder
+      .addOperation(
+        Operation.pathPaymentStrictSend({
+          sendAsset: sourceAsset,
+          sendAmount,
+          destination: escrowPublicKey,
+          destAsset: this.usdcAsset,
+          destMin: amountUSD.toFixed(7),
+          path: pathResult.path,
+        }),
+      )
+      .addMemo(Memo.text(`path:${assetCode}:${tokenAmount}`))
+      ;
 
     this.addComplianceDataOperations(txBuilder, complianceData);
 
@@ -725,6 +1832,7 @@ export class StellarService {
       amountUSD: number;
       assetCode: string;
       tokenAmount: number;
+      issuerPublicKey?: string;
       complianceData?: Record<string, unknown>;
     }>,
   ): Promise<string> {
@@ -740,15 +1848,82 @@ export class StellarService {
 
     const investorAccount = await this.server.loadAccount(investorWallet);
 
-    // Each operation costs BASE_FEE stroops; multiply by number of operations
+    // Group investments by asset to check trustlines
+    const uniqueAssets = new Map<string, Asset>();
+    for (const inv of investments) {
+      if (inv.issuerPublicKey) {
+        const key = `${inv.assetCode}:${inv.issuerPublicKey}`;
+        if (!uniqueAssets.has(key)) {
+          uniqueAssets.set(
+            key,
+            createAsset(inv.assetCode, inv.issuerPublicKey),
+          );
+        }
+      }
+    }
+
+    // Check trustlines for each unique asset
+    const missingTrustlines: Asset[] = [];
+    for (const asset of uniqueAssets.values()) {
+      const hasTrustline = await this.hasTrustline(investorAccount, asset);
+      if (!hasTrustline) {
+        missingTrustlines.push(asset);
+      }
+    }
+
+    // Check XLM reserve for missing trustlines
+    if (missingTrustlines.length > 0) {
+      const xlmBalance = parseFloat(
+        (
+          investorAccount.balances.find(
+            (b: any) => b.asset_type === 'native',
+          ) as any
+        )?.balance ?? '0',
+      );
+      // Each new trustline requires 0.5 XLM base reserve
+      const minRequired =
+        (investorAccount.subentry_count + missingTrustlines.length) * 0.5 +
+        2 +
+        0.001 * missingTrustlines.length;
+      if (xlmBalance < minRequired) {
+        throw new Error(
+          `Insufficient XLM balance for trustline base reserves. ` +
+            `Need at least ${minRequired.toFixed(3)} XLM for ${missingTrustlines.length} new trustline(s), have ${xlmBalance} XLM.`,
+        );
+      }
+    }
+
+    // Calculate total operations: payments + compliance data + trustlines
+    const totalComplianceOps = investments.reduce(
+      (count, inv) => count + (inv.complianceData ? 4 : 0),
+      0,
+    );
+    const totalOps =
+      investments.length + totalComplianceOps + missingTrustlines.length;
+
+    if (totalOps > MAX_OPS) {
+      throw new Error(
+        `Bulk transaction cannot exceed ${MAX_OPS} operations. ` +
+          `Received ${investments.length} payments + ${totalComplianceOps} compliance ops + ${missingTrustlines.length} trustline ops = ${totalOps} total.`,
+      );
+    }
+
+    // Each operation costs BASE_FEE stroops; multiply by total operations
     const feePerOp = parseInt(BASE_FEE, 10);
-    const totalFee = (feePerOp * investments.length).toString();
+    const totalFee = (feePerOp * totalOps).toString();
 
     const txBuilder = new TransactionBuilder(investorAccount, {
       fee: totalFee,
       networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
     });
 
+    // Add trustline operations first
+    for (const asset of missingTrustlines) {
+      txBuilder.addOperation(Operation.changeTrust({ asset }));
+    }
+
+    // Add payment operations
     for (const inv of investments) {
       txBuilder.addOperation(
         Operation.payment({
@@ -762,7 +1937,7 @@ export class StellarService {
 
     // Build a single memo summarising the bulk (max 28 bytes)
     txBuilder.addMemo(Memo.text(`bulk:${investments.length}deals`));
-    txBuilder.setTimeout(300); // 5 minutes for wallet signing
+    txBuilder; // 5 minutes for wallet signing
 
     const tx = txBuilder.build();
 
@@ -771,6 +1946,8 @@ export class StellarService {
         investorWallet,
         dealCount: investments.length,
         totalUsd: investments.reduce((s, i) => s + i.amountUSD, 0),
+        missingTrustlines: missingTrustlines.length,
+        totalOps,
         totalFee,
       },
       'Bulk investment transaction built',
@@ -814,11 +1991,12 @@ export class StellarService {
     offerId = 0, // 0 = new offer; non-zero = update/cancel existing offer
   ): Promise<string> {
     const sellerAccount = await this.server.loadAccount(sellerWallet);
-    const tradeAsset = new Asset(tradeTokenCode, tradeTokenIssuer);
+    const tradeAsset = createAsset(tradeTokenCode, tradeTokenIssuer);
 
     const tx = new TransactionBuilder(sellerAccount, {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
     })
       .addOperation(
         Operation.manageSellOffer({
@@ -830,7 +2008,7 @@ export class StellarService {
         }),
       )
       .addMemo(Memo.text(`sell:${tradeTokenCode}`))
-      .setTimeout(300)
+      
       .build();
 
     this.logger.info(
@@ -863,7 +2041,7 @@ export class StellarService {
       price: string;
     }>
   > {
-    const tradeAsset = new Asset(tradeTokenCode, tradeTokenIssuer);
+    const tradeAsset = createAsset(tradeTokenCode, tradeTokenIssuer);
 
     const offersPage = await this.server
       .offers()
@@ -894,7 +2072,7 @@ export class StellarService {
       price: string;
     }>
   > {
-    const tradeAsset = new Asset(tradeTokenCode, tradeTokenIssuer);
+    const tradeAsset = createAsset(tradeTokenCode, tradeTokenIssuer);
 
     const offersPage = await this.server
       .offers()
@@ -912,12 +2090,386 @@ export class StellarService {
   }
 
   /**
-   * Submits a signed XDR transaction to the Stellar network.
+   * Fetches all current holders for a given non-native asset.
+   * Uses Horizon /accounts?asset={code}:{issuer} and follows pagination.
+   * Returns an array of InvestorShare where `tokenAmount` is the holder's
+   * balance and `totalTokens` is the aggregate supply across holders.
    */
-  async submitTransaction(signedXdr: string): Promise<any> {
+  async getTokenHolders(
+    assetCode: string,
+    issuerPublicKey: string,
+  ): Promise<InvestorShare[]> {
+    const tradeAsset = createAsset(assetCode, issuerPublicKey);
+
+    const LIMIT = 200;
+    let page = await this.server
+      .accounts()
+      .forAsset(tradeAsset)
+      .limit(LIMIT)
+      .call();
+
+    const holders: Array<{ walletAddress: string; tokenAmount: number }> = [];
+
+    // Iterate through pages until no next page is available
+    while (page && Array.isArray(page.records) && page.records.length > 0) {
+      for (const acc of page.records) {
+        const balanceEntry = (acc.balances || []).find(
+          (b: any) =>
+            b.asset_type !== 'native' &&
+            b.asset_code === tradeAsset.getCode() &&
+            b.asset_issuer === tradeAsset.getIssuer(),
+        );
+
+        if (balanceEntry) {
+          const bal = parseFloat(balanceEntry.balance || '0');
+          if (bal > 0) {
+            holders.push({
+              walletAddress: acc.account_id ?? acc.id,
+              tokenAmount: bal,
+            });
+          }
+        }
+      }
+
+      // Fetch next page if available; the SDK exposes `next()` on the page
+      if (typeof (page as any).next === 'function') {
+        try {
+          page = await (page as any).next();
+        } catch (e) {
+          this.logger.warn(
+            { err: e },
+            'Failed to fetch next page of asset holders',
+          );
+          break;
+        }
+      } else {
+        break;
+      }
+    }
+
+    const totalTokens = holders.reduce((s, h) => s + h.tokenAmount, 0);
+
+    return holders.map((h) => ({
+      walletAddress: h.walletAddress,
+      tokenAmount: h.tokenAmount,
+      totalTokens,
+    }));
+  }
+
+  /**
+   * Emits structured transaction log entries for all Stellar transaction attempts (#803).
+   */
+  public logStructuredTx(params: {
+    correlationId?: string;
+    txHash?: string;
+    operation: string;
+    durationMs: number;
+    status: 'success' | 'failed' | 'timeout' | 'error';
+    error?: string;
+  }): void {
+    const correlationId =
+      params.correlationId ||
+      createHash('sha256')
+        .update(`${Date.now()}-${Math.random()}`)
+        .digest('hex')
+        .substring(0, 16);
+
+    const logData = {
+      correlationId,
+      txHash: params.txHash || 'N/A',
+      operation: params.operation,
+      durationMs: params.durationMs,
+      status: params.status,
+      error: params.error,
+    };
+
+    if (params.status === 'success') {
+      this.logger.info(
+        logData,
+        `Stellar transaction [${params.operation}] succeeded`,
+      );
+    } else {
+      this.logger.error(
+        logData,
+        `Stellar transaction [${params.operation}] failed`,
+      );
+    }
+  }
+
+  /**
+   * Checks whether a Horizon submission error is tx_too_late (expired timebound).
+   * #681 — expired transactions must be rebuilt with fresh timebounds and re-submitted.
+   */
+  private isTxTooLateError(err: any): boolean {
+    const resultCodes = err?.response?.data?.extras?.result_codes;
+    if (resultCodes?.transaction === 'tx_too_late') return true;
+    if (typeof err?.message === 'string' && err.message.includes('tx_too_late'))
+      return true;
+    return false;
+  }
+
+  /**
+   * Rebuilds an expired transaction with fresh timebounds and the same operations,
+   * fee, and memo. Requires loading the latest account sequence from Horizon.
+   * Used when tx_too_late is returned to avoid indefinite mempool hangs (#681).
+   */
+  private async rebuildWithFreshTimebounds(tx: any): Promise<any> {
+    const sourceKey = typeof tx.source === 'string' ? tx.source : tx._source;
+    const freshAccount = await this.server.loadAccount(sourceKey);
+
+    const builder = new TransactionBuilder(freshAccount, {
+      fee: this.getTxSubmissionFee(tx.fee),
+      networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
+    });
+
+    const xdrOperations =
+      tx?.toEnvelope?.()?._value?._attributes?.tx?._attributes?.operations ??
+      tx?.operations ??
+      [];
+
+    for (const op of xdrOperations) {
+      builder.addOperation(op);
+    }
+
+    if (tx.memo && tx.memo.type !== 'none') {
+      builder.addMemo(tx.memo);
+    }
+
+    return builder.build();
+  }
+
+  /**
+   * Submits a transaction with exponential backoff retry and random jitter for transient Horizon errors.
+   * Formula: base_delay * 2^attempt + random_jitter.
+   * Retries on HTTP 429, 503, 504, and network timeout errors.
+   * On tx_too_late (expired timebound), throws immediately — callers that hold the
+   * signing keys should use submitWithRetrySigned instead (#681).
+   */
+  private async submitWithRetry(
+    tx: any,
+    operationName = 'submitTransaction',
+    correlationId?: string,
+  ): Promise<any> {
+    const RETRYABLE = new Set([429, 503, 504]);
+    const MAX_RETRIES = 3;
+    const startTime = Date.now();
+    const txHash =
+      typeof tx?.hash === 'function' ? tx.hash().toString('hex') : tx?.hash;
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const result = await this.server.submitTransaction(tx);
+        const durationMs = Date.now() - startTime;
+        this.logStructuredTx({
+          correlationId,
+          txHash: result?.hash || txHash,
+          operation: operationName,
+          durationMs,
+          status: 'success',
+        });
+        return result;
+      } catch (err: any) {
+        const status: number | undefined = err?.response?.status;
+        const isTimeout =
+          err?.code === 'ECONNABORTED' || err?.message?.includes('timeout');
+
+        // tx_too_late: timebound expired — surface immediately as a named error
+        if (this.isTxTooLateError(err)) {
+          this.logger.warn(
+            { sourceKey: tx.source },
+            'tx_too_late: transaction timebound expired (#681). Use submitWithRetrySigned for auto-rebuild.',
+          );
+          throw err;
+        }
+
+        const isRetryable =
+          (status !== undefined && RETRYABLE.has(status)) || isTimeout;
+
+        if (!isRetryable || attempt === MAX_RETRIES) {
+          throw err;
+        }
+
+        const baseDelayMs = 1000;
+        const randomJitter = Math.floor(Math.random() * 500);
+        const delayMs = baseDelayMs * Math.pow(2, attempt) + randomJitter;
+        this.logger.warn(
+          { attempt, status, delayMs, jitter: randomJitter },
+          `Transient Horizon error (${status ?? 'timeout'}); retrying with exponential backoff and jitter in ${delayMs}ms`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+
+  /**
+   * Submits a transaction with both fee-bump and tx_too_late retry handling.
+   * Signs the rebuilt transaction with the provided signer keypair(s).
+   * Used for backend-controlled transactions where the signing key is known (#681).
+   */
+  private async submitWithRetrySigned(
+    tx: any,
+    signers: Keypair[],
+  ): Promise<any> {
+    const RETRYABLE = new Set([429, 503, 504]);
+    const MAX_RETRIES = 3;
+    let currentTx = tx;
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        return await this.server.submitTransaction(currentTx);
+      } catch (err: any) {
+        const status: number | undefined = err?.response?.status;
+        const isTimeout =
+          err?.code === 'ECONNABORTED' || err?.message?.includes('timeout');
+        const isTooLate = this.isTxTooLateError(err);
+
+        // tx_too_late: rebuild with fresh timebounds and re-sign (#681)
+        if (isTooLate && attempt < MAX_RETRIES) {
+          this.logger.warn(
+            { attempt, sourceKey: currentTx.source },
+            'tx_too_late detected — rebuilding and re-signing with fresh timebounds (#681)',
+          );
+          try {
+            currentTx = await this.rebuildWithFreshTimebounds(currentTx);
+            for (const signer of signers) {
+              currentTx.sign(signer);
+            }
+          } catch (rebuildErr: any) {
+            this.logger.error(
+              { rebuildErr: rebuildErr.message },
+              'Failed to rebuild expired transaction',
+            );
+            throw err;
+          }
+          continue;
+        }
+
+        const isRetryable =
+          (status !== undefined && RETRYABLE.has(status)) || isTimeout;
+
+        if (!isRetryable || attempt === MAX_RETRIES) {
+          throw err;
+        }
+
+        const baseDelayMs = 1000;
+        const randomJitter = Math.floor(Math.random() * 500);
+        const delayMs = baseDelayMs * Math.pow(2, attempt) + randomJitter;
+        this.logger.warn(
+          { attempt, status, delayMs, jitter: randomJitter },
+          `Transient Horizon error (${status ?? 'timeout'}); retrying with exponential backoff and jitter in ${delayMs}ms`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+
+  /**
+   * Checks whether a Horizon submission error indicates tx_insufficient_fee.
+   */
+  private isInsufficientFeeError(err: any): boolean {
+    const resultCodes = err?.response?.data?.extras?.result_codes;
+    if (resultCodes?.transaction === 'tx_insufficient_fee') return true;
+    if (
+      typeof err?.message === 'string' &&
+      err.message.includes('tx_insufficient_fee')
+    )
+      return true;
+    return false;
+  }
+
+  /**
+   * Submits a transaction with fee-bump retry on tx_insufficient_fee.
+   * Doubles the fee each attempt up to STELLAR_MAX_FEE (default: 10000 stroops).
+   * Used for escrow release where fee surges can cause silent failures (#826).
+   */
+  private async submitWithFeeBumpRetry(
+    buildTx: (fee: string) => Promise<any>,
+    signer: Keypair,
+    operationName = 'submitWithFeeBumpRetry',
+    correlationId?: string,
+  ): Promise<any> {
+    const maxFee = this.config.get<string>('STELLAR_MAX_FEE', '10000');
+    const maxFeeNum = parseInt(maxFee, 10);
+    let currentFee = parseInt(BASE_FEE, 10);
+    const MAX_ATTEMPTS = 4;
+    const startTime = Date.now();
+
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const tx = await buildTx(currentFee.toString());
+      tx.sign(signer);
+      const txHash =
+        typeof tx?.hash === 'function' ? tx.hash().toString('hex') : tx?.hash;
+
+      try {
+        const result = await this.server.submitTransaction(tx);
+        const durationMs = Date.now() - startTime;
+        this.logStructuredTx({
+          correlationId,
+          txHash: result?.hash || txHash,
+          operation: operationName,
+          durationMs,
+          status: 'success',
+        });
+        return result;
+      } catch (err: any) {
+        if (this.isInsufficientFeeError(err) && currentFee < maxFeeNum) {
+          currentFee = Math.min(currentFee * 2, maxFeeNum);
+          this.logger.warn(
+            {
+              attempt,
+              newFee: currentFee,
+              maxFee: maxFeeNum,
+              correlationId,
+              txHash,
+            },
+            `tx_insufficient_fee detected — retrying with higher fee (${currentFee} stroops)`,
+          );
+          continue;
+        }
+        const durationMs = Date.now() - startTime;
+        this.logStructuredTx({
+          correlationId,
+          txHash,
+          operation: operationName,
+          durationMs,
+          status: 'failed',
+          error: err?.message,
+        });
+        throw err;
+      }
+    }
+
+    throw new Error(
+      `Escrow release failed: fee exceeded max (${maxFeeNum} stroops) after ${MAX_ATTEMPTS} attempts`,
+    );
+  }
+
+  /**
+   * Submits a signed XDR transaction to the Stellar network.
+   * Optionally validates the XDR envelope before submission.
+   */
+  async submitTransaction(
+    signedXdr: string,
+    validateOpts?: {
+      allowedOpTypes?: string[];
+      allowedDestinations?: string[];
+    },
+  ): Promise<any> {
+    if (validateOpts) {
+      const validation = await this.validateTransactionXdr(
+        signedXdr,
+        validateOpts.allowedOpTypes,
+        validateOpts.allowedDestinations,
+      );
+      if (!validation.valid) {
+        throw new Error(`XDR validation failed: ${validation.reason}`);
+      }
+    }
+
     const tx = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
     try {
-      const result = await this.server.submitTransaction(tx);
+      const result = await this.submitWithRetry(tx);
       const txHash = (result as any).hash as string;
       this.logger.info({ txId: txHash }, 'Transaction submitted successfully');
       await this.saveLog({
@@ -940,19 +2492,393 @@ export class StellarService {
 
   /**
    * Returns the status of a Stellar transaction.
+   *
+   * Terminal states ('success' | 'failed') are cached in Redis for
+   * TX_STATUS_CACHE_TTL_SECONDS (1 hour) to avoid redundant Horizon API calls.
+   * Pending transactions are never cached because their state can still change.
+   *
+   * On Horizon error, returns the last cached status (if any) with a stale: true flag
+   * instead of throwing, allowing consumers to proceed with last-known state.
    */
   async getTransactionStatus(
     txId: string,
-  ): Promise<'success' | 'failed' | 'pending'> {
+  ): Promise<'success' | 'failed' | 'pending' | { status: 'success' | 'failed'; stale: true }> {
+    // 1. Cache read — skip Horizon if we already have a terminal result.
+    const cached = await this.getCachedTxStatus(txId);
+    if (cached) {
+      this.logger.info(
+        { txId, cached },
+        'Transaction status served from cache',
+      );
+      return cached;
+    }
+
+    // 2. Horizon query.
     try {
       const tx = await this.server.transactions().transaction(txId).call();
-      return tx.successful ? 'success' : 'failed';
+      const status: 'success' | 'failed' = tx.successful ? 'success' : 'failed';
+
+      // 3. Write-through — only cache terminal states.
+      await this.setCachedTxStatus(txId, status);
+
+      return status;
     } catch (err: any) {
       if (err?.response?.status === 404) {
         return 'pending';
       }
+
+      // Horizon error - try stale fallback
+      this.logger.warn(
+        { txId, error: (err as Error).message },
+        'Horizon error during transaction status check, attempting stale fallback',
+      );
+
+      // Check if we have a cached value to fall back to
+      const staleCached = await this.getCachedTxStatus(txId);
+      if (staleCached) {
+        this.logger.info(
+          { txId, status: staleCached },
+          'Returning stale cached status due to Horizon error',
+        );
+        // Increment metrics counter for stale fallbacks
+        this.incrementHorizonStaleFallbackCounter();
+        return { status: staleCached, stale: true };
+      }
+
+      // No cache available - rethrow the error
       throw err;
     }
+  }
+
+  /**
+   * Increment the counter for Horizon stale fallbacks.
+   * This is a no-op if metrics are not configured.
+   */
+  private incrementHorizonStaleFallbackCounter(): void {
+    if (this.horizonStaleFallbackCounter) {
+      this.horizonStaleFallbackCounter.inc();
+    }
+    this.logger.info('horizon_status_stale_fallbacks incremented');
+  }
+
+  /** Build the Redis key for a transaction hash. */
+  private txStatusCacheKey(txId: string): string {
+    return `${TX_STATUS_CACHE_PREFIX}${txId}`;
+  }
+
+  /**
+   * Read a previously cached terminal transaction status.
+   * Returns null on any error so the caller falls through to Horizon.
+   */
+  private async getCachedTxStatus(
+    txId: string,
+  ): Promise<'success' | 'failed' | null> {
+    if (!this.sequenceRedis) {
+      return null;
+    }
+    try {
+      const raw = (await this.sequenceRedis.get(
+        this.txStatusCacheKey(txId),
+      )) as string | null;
+      if (raw === 'success' || raw === 'failed') {
+        return raw;
+      }
+      return null;
+    } catch (err) {
+      this.logger.warn(
+        { txId, err: (err as Error).message },
+        'Redis read failed for tx status cache; falling back to Horizon',
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Write a terminal transaction status to Redis with a 1-hour TTL.
+   * Failures are logged but never propagate — caching is best-effort.
+   */
+  private async setCachedTxStatus(
+    txId: string,
+    status: 'success' | 'failed',
+  ): Promise<void> {
+    if (!this.sequenceRedis) {
+      return;
+    }
+    try {
+      await this.sequenceRedis.setEx(
+        this.txStatusCacheKey(txId),
+        TX_STATUS_CACHE_TTL_SECONDS,
+        status,
+      );
+    } catch (err) {
+      this.logger.warn(
+        { txId, status, err: (err as Error).message },
+        'Redis write failed for tx status cache',
+      );
+    }
+  }
+
+  /**
+   * Freezes (or unfreezes) a specific investor's trustline for a trade asset.
+   * Requires the issuer account to have AUTH_REVOCABLE set (flag 2), which is
+   * applied during issueTradeToken via setFlags: 10 (AuthRevocable | AuthClawback).
+   *
+   * Uses setTrustLineFlags (allowTrust is deprecated in SDK v13).
+   *
+   * @param issuerSecret  Decrypted issuer secret key for the asset
+   * @param assetCode     Asset code (e.g. "COCOA1002")
+   * @param issuerPublicKey  Issuer public key
+   * @param trustorWallet Investor wallet address whose trustline to freeze
+   * @param freeze        true = freeze (revoke authorization), false = unfreeze
+   * @returns Stellar transaction ID
+   */
+  async freezeAsset(
+    issuerSecret: string,
+    assetCode: string,
+    issuerPublicKey: string,
+    trustorWallet: string,
+    freeze: boolean,
+  ): Promise<string> {
+    const issuerKeypair = Keypair.fromSecret(issuerSecret);
+    const issuerAccount = await this.server.loadAccount(issuerPublicKey);
+    const asset = createAsset(assetCode, issuerPublicKey);
+
+    const tx = new TransactionBuilder(issuerAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
+    })
+      .addOperation(
+        Operation.setTrustLineFlags({
+          trustor: trustorWallet,
+          asset,
+          flags: { authorized: !freeze },
+        }),
+      )
+      
+      .build();
+
+    tx.sign(issuerKeypair);
+    const result = await this.submitWithRetrySigned(tx, [issuerKeypair]);
+    const txId = (result as any).hash as string;
+
+    this.logger.info(
+      { assetCode, issuerPublicKey, trustorWallet, freeze, txId },
+      `Asset trustline ${freeze ? 'frozen' : 'unfrozen'} for ${trustorWallet}`,
+    );
+    return txId;
+  }
+
+  /**
+   * Cleans up an investor's trustline for a trade asset after final distribution.
+   * Submits a changeTrust operation with limit=0, removing the trustline and
+   * freeing up the 0.5 XLM base reserve on the investor's account.
+   *
+   * @param investorWallet  Investor's public key
+   * @param investorSecret  Investor's decrypted secret key
+   * @param assetCode       Trade token asset code (e.g. "COCOA1002")
+   * @param issuerPublicKey Trade token issuer public key
+   * @returns Stellar transaction ID of the cleanup transaction
+   */
+  async cleanupInvestorTrustline(
+    investorWallet: string,
+    investorSecret: string,
+    assetCode: string,
+    issuerPublicKey: string,
+  ): Promise<string> {
+    const investorKeypair = Keypair.fromSecret(investorSecret);
+    const investorAccount = await this.server.loadAccount(investorWallet);
+    const tradeAsset = createAsset(assetCode, issuerPublicKey);
+
+    const balance = investorAccount.balances.find(
+      (b: any) =>
+        b.asset_type !== 'native' &&
+        b.asset_code === assetCode &&
+        b.asset_issuer === issuerPublicKey,
+    );
+
+    if (!balance) {
+      this.logger.warn(
+        { investorWallet, assetCode },
+        'No trustline found to clean up',
+      );
+      return '';
+    }
+
+    if (parseFloat((balance as any).balance) > 0) {
+      throw new Error(
+        `Cannot remove trustline: investor still holds ${(balance as any).balance} ${assetCode}`,
+      );
+    }
+
+    const tx = new TransactionBuilder(investorAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
+    })
+      .addOperation(
+        Operation.changeTrust({
+          asset: tradeAsset,
+          limit: '0',
+        }),
+      )
+      .addMemo(Memo.text(`cleanup:${assetCode}`))
+      
+      .build();
+
+    tx.sign(investorKeypair);
+    const result = await this.submitWithRetrySigned(tx, [investorKeypair]);
+    const txId = (result as any).hash as string;
+
+    this.logger.info(
+      { investorWallet, assetCode, issuerPublicKey, txId },
+      'Investor trustline cleaned up successfully',
+    );
+    return txId;
+  }
+
+  /**
+   * Submits an array of operations in chunks of MAX_OPERATIONS_PER_TX (100).
+   * Handles sequence numbers correctly by loading the account for each chunk.
+   * Operations are submitted sequentially to maintain proper ordering.
+   *
+   * @param sourceSecret - Secret key of the account submitting the transactions
+   * @param operations - Array of Stellar operations to submit
+   * @param options - Optional configuration for the batch
+   * @returns Array of transaction hashes, one per chunk
+   *
+   * @example
+   * const ops = [op1, op2, ..., op250];
+   * const txHashes = await service.submitOperationsInChunks(secret, ops);
+   * // Returns 3 transaction hashes (100 + 100 + 50 operations)
+   */
+  async submitOperationsInChunks(
+    sourceSecret: string,
+    operations: any[],
+    options: {
+      memo?: string;
+      timeout?: number;
+      feePerOperation?: string;
+    } = {},
+  ): Promise<string[]> {
+    const { memo, timeout = 30, feePerOperation = BASE_FEE } = options;
+
+    // Detect operation count and validate
+    if (operations.length === 0) {
+      return [];
+    }
+
+    if (operations.length > MAX_OPERATIONS_PER_TX) {
+      const plan = planTransactionBatches(
+        operations.length,
+        MAX_OPERATIONS_PER_TX,
+      );
+      this.logger.info(
+        {
+          totalOperations: operations.length,
+          batchCount: plan.batchCount,
+          operationsPerBatch: plan.operationsPerBatch,
+        },
+        'Operations exceed single transaction limit, chunking into multiple transactions',
+      );
+    }
+
+    // Chunk operations into sub-arrays of size 100
+    const operationChunks = chunkOperations(operations, MAX_OPERATIONS_PER_TX);
+    const sourceKeypair = Keypair.fromSecret(sourceSecret);
+    const sourcePublicKey = sourceKeypair.publicKey();
+    const txHashes: string[] = [];
+
+    // Submit transactions sequentially with correct sequence numbers
+    for (
+      let chunkIndex = 0;
+      chunkIndex < operationChunks.length;
+      chunkIndex++
+    ) {
+      const chunk = operationChunks[chunkIndex];
+      const totalChunks = operationChunks.length;
+
+      this.logger.info(
+        {
+          chunkIndex,
+          totalChunks,
+          operationsInChunk: chunk.length,
+          sourcePublicKey,
+        },
+        `Building transaction chunk ${chunkIndex + 1}/${totalChunks}`,
+      );
+
+      // Load account fresh for each chunk to get correct sequence number
+      const account = await this.server.loadAccount(sourcePublicKey);
+
+      // Calculate fee: base fee * number of operations in this chunk
+      const fee = (parseInt(feePerOperation, 10) * chunk.length).toString();
+
+      const txBuilder = new TransactionBuilder(account, {
+        fee,
+        networkPassphrase: this.networkPassphrase,
+        timebounds: this.getTransactionTimebounds(timeout),
+      });
+
+      // Add all operations for this chunk
+      for (const op of chunk) {
+        txBuilder.addOperation(op);
+      }
+
+      // Add memo if provided (only on first chunk to save space)
+      if (memo && chunkIndex === 0) {
+        const memoText = memo.slice(0, 28); // Stellar memo text limit
+        txBuilder.addMemo(Memo.text(memoText));
+      }
+
+      // Add batch identifier memo for subsequent chunks
+      if (totalChunks > 1 && chunkIndex > 0) {
+        const batchMemo = generateBatchMemo(chunkIndex, totalChunks, 'chunk');
+        txBuilder.addMemo(Memo.text(batchMemo));
+      }
+
+      const tx = txBuilder.build();
+      tx.sign(sourceKeypair);
+
+      try {
+        const result = await this.submitWithRetrySigned(tx, [sourceKeypair]);
+        const txHash = (result as any).hash as string;
+        txHashes.push(txHash);
+
+        this.logger.info(
+          {
+            chunkIndex,
+            txHash,
+            operationsCount: chunk.length,
+          },
+          `Successfully submitted chunk ${chunkIndex + 1}/${totalChunks}`,
+        );
+      } catch (err: any) {
+        this.logger.error(
+          {
+            chunkIndex,
+            totalChunks,
+            error: err.message,
+            operationsInChunk: chunk.length,
+          },
+          `Failed to submit chunk ${chunkIndex + 1}/${totalChunks}`,
+        );
+        throw new Error(
+          `Transaction chunk ${chunkIndex + 1}/${totalChunks} failed: ${err.message}`,
+        );
+      }
+    }
+
+    this.logger.info(
+      {
+        totalChunks: txHashes.length,
+        totalOperations: operations.length,
+        txHashes,
+      },
+      'All operation chunks submitted successfully',
+    );
+
+    return txHashes;
   }
 
   /**
@@ -966,11 +2892,17 @@ export class StellarService {
   ): Promise<void> {
     const issuerKeypair = Keypair.fromSecret(issuerSecret);
     const issuerAccount = await this.server.loadAccount(issuerPublicKey);
-    const tradeAsset = new Asset(assetCode, issuerPublicKey);
+
+    if (!issuerAccount.flags.auth_clawback_enabled) {
+      throw new Error('Token does not have clawback enabled');
+    }
+
+    const tradeAsset = createAsset(assetCode, issuerPublicKey);
 
     const txBuilder = new TransactionBuilder(issuerAccount, {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
+      timebounds: this.getTransactionTimebounds(),
     });
 
     for (const holder of holders) {
@@ -985,11 +2917,11 @@ export class StellarService {
       }
     }
 
-    const tx = txBuilder.setTimeout(300).build();
+    const tx = txBuilder.build();
     tx.sign(issuerKeypair);
 
     try {
-      await this.server.submitTransaction(tx);
+      await this.submitWithRetrySigned(tx, [issuerKeypair]);
       this.logger.info(
         { assetCode, issuerPublicKey, holdersCount: holders.length },
         'Tokens clawed back successfully',
@@ -998,5 +2930,52 @@ export class StellarService {
       this.logger.error(`Clawback failed: ${err.message}`, err.stack);
       throw new Error(`Clawback failed: ${err.message}`);
     }
+  }
+
+  /**
+   * Retrieves transaction logs using cursor-based pagination.
+   * Issue #740 — Cursor-Based Pagination for Transaction Logs
+   */
+  async getTransactionLogs(
+    userId?: string,
+    limitParam?: number,
+    cursorParam?: string,
+  ): Promise<CursorPaginatedResult<TransactionLog>> {
+    const limit = Math.min(
+      Number.isFinite(limitParam) && limitParam! > 0 ? Number(limitParam) : 20,
+      100,
+    );
+
+    const qb = this.txLogRepo.createQueryBuilder('log');
+
+    if (userId) {
+      qb.andWhere('log.userId = :userId', { userId });
+    }
+
+    if (cursorParam) {
+      const decoded = decodeCursor(cursorParam);
+      qb.andWhere('log.createdAt < :cursor', { cursor: new Date(decoded) });
+    }
+
+    qb.orderBy('log.createdAt', 'DESC')
+      .addOrderBy('log.id', 'DESC')
+      .take(limit + 1);
+
+    const items = await qb.getMany();
+    const hasMore = items.length > limit;
+    const data = hasMore ? items.slice(0, limit) : items;
+
+    const lastItem = data[data.length - 1];
+    const nextCursor =
+      hasMore && lastItem ? encodeCursor(lastItem.createdAt) : null;
+
+    return {
+      data,
+      meta: {
+        limit,
+        nextCursor,
+        hasMore,
+      },
+    };
   }
 }

@@ -16,6 +16,7 @@ import { StellarService } from '../stellar/stellar.service';
 import { QueueService } from '../queue/queue.service';
 import { ConfigService } from '@nestjs/config';
 import { TradeDeal } from '../trade-deals/entities/trade-deal.entity';
+import { buildShipmentMemo } from '../stellar/anchor-memo';
 
 const MILESTONE_SEQUENCE: MilestoneType[] = [
   'farm',
@@ -37,7 +38,7 @@ export class ShipmentsService {
     private readonly config: ConfigService,
     private readonly dataSource: DataSource,
   ) {
-    this.logger.setContext(ShipmentsService.name);
+    (this.logger as any).setContext(ShipmentsService.name);
   }
 
   async recordMilestone(
@@ -94,14 +95,9 @@ export class ShipmentsService {
       }
 
       // 5.2 — anchor on Stellar
-      const dealIdShort = deal.id.replace(/-/g, '').slice(0, 8);
-      const unixTs = Math.floor(Date.now() / 1000);
-      const memoText = `AGRIC:MILESTONE:${dealIdShort}:${dto.milestone}:${unixTs}`;
+      const memoText = buildShipmentMemo(deal.id, dto.milestone);
 
-      let signerSecret = this.config.get<string>(
-        'STELLAR_PLATFORM_SECRET',
-        '',
-      );
+      let signerSecret = this.config.get<string>('STELLAR_PLATFORM_SECRET', '');
       if (deal.escrowSecretKey) {
         signerSecret = this.stellarService.decryptSecret(deal.escrowSecretKey);
       }
@@ -120,8 +116,10 @@ export class ShipmentsService {
         notes: dto.notes ?? null,
         stellarTxId,
         memoText,
-        latitude: dto.latitude ?? null,
-        longitude: dto.longitude ?? null,
+        // Prefer structured location object; fall back to legacy top-level fields
+        latitude: dto.location?.lat ?? dto.latitude ?? null,
+        longitude: dto.location?.lng ?? dto.longitude ?? null,
+        evidenceDocumentIds: dto.evidence?.length ? dto.evidence : null,
       });
 
       const savedMilestone = await manager.save(milestone);
@@ -129,8 +127,10 @@ export class ShipmentsService {
       // 5.5 — Handle importer milestone: transition to delivered and enqueue job
       if (dto.milestone === 'importer') {
         // Update trade deal status to delivered
+        const appTraceId = `app-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 10)}`;
         await manager.update(TradeDeal, dto.trade_deal_id, {
           status: 'delivered',
+          appTraceId,
         });
 
         // Enqueue deal.delivered job for escrow release

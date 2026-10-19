@@ -1,0 +1,625 @@
+"use client";
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
+import dynamic from "next/dynamic";
+import { apiClient, Investment } from "../../../../lib/api";
+import { useDashboardData } from "../../../../hooks/useDashboardData";
+import { useCurrencyConversion } from "../../../../hooks/useCurrencyConversion";
+import { useCurrencyFormat } from "../../../../hooks/useCurrencyFormat";
+import { useNumberFormat } from "../../../../hooks/useNumberFormat";
+import DashboardLayout from "../../../../components/DashboardLayout";
+import StatCard from "../../../../components/StatCard";
+import DualCurrencyStatCard from "../../../../components/DualCurrencyStatCard";
+import CancelInvestmentButton from "../../../../components/CancelInvestmentButton";
+import ReferralDashboard from "../../../../components/ReferralDashboard";
+import type { ReferralAnalytics } from "../../../../components/ReferralDashboard";
+
+// Heavy chart / certificate components — loaded only when the user navigates
+// to their respective tabs, keeping the initial dashboard bundle small.
+const PortfolioChart = dynamic(
+  () => import("../../../../components/dashboard/PortfolioChart"),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="card h-56 skeleton" aria-label="Loading chart…" />
+    ),
+  },
+);
+
+const InvestmentCertificate = dynamic(
+  () =>
+    import("../../../../components/InvestmentCertificate").then((m) => ({
+      default: m.InvestmentCertificate,
+    })),
+  {
+    loading: () => (
+      <div className="card h-40 skeleton" aria-label="Loading certificate…" />
+    ),
+  },
+);
+
+const AnchorWidget = dynamic(
+  () =>
+    import("../../../../components/AnchorWidget").then((m) => ({
+      default: m.AnchorWidget,
+    })),
+  {
+    loading: () => (
+      <div className="card h-32 skeleton" aria-label="Loading widget…" />
+    ),
+  },
+);
+
+const DealHealthWidget = dynamic(
+  () =>
+    import("../../../../components/deals/DealHealthWidget").then((m) => ({
+      default: m.DealHealthWidget,
+    })),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="h-24 skeleton rounded-xl" aria-label="Loading deal health…" />
+    ),
+  },
+);
+
+const INV_STATUS: Record<string, string> = {
+  confirmed: "badge-green",
+  pending: "badge-yellow",
+  failed: "badge-red",
+  refunded: "badge-gray",
+};
+const DEAL_STATUS: Record<string, string> = {
+  open: "badge-green",
+  funded: "badge-blue",
+  completed: "badge-gray",
+  delivered: "badge-purple",
+  failed: "badge-red",
+};
+
+type Tab = "portfolio" | "certificates" | "fiat";
+
+export default function InvestorDashboard() {
+  const { formatCurrency } = useCurrencyFormat();
+  const { formatNumber } = useNumberFormat();
+  const router = useRouter();
+  const { data, loading, isOffline } = useDashboardData();
+  const [filter, setFilter] = useState<"all" | "confirmed" | "pending">("all");
+  const [tab, setTab] = useState<Tab>("portfolio");
+  const [referralData, setReferralData] = useState<ReferralAnalytics | null>(null);
+  const [referralLoading, setReferralLoading] = useState(true);
+
+  const user = data?.user ?? null;
+  const investments: Investment[] = data?.investments ?? [];
+
+  // Set up currency conversion with user's preferred currency
+  const { convert, lastUpdated } = useCurrencyConversion(
+    user?.preferredCurrency,
+  );
+
+  // Anonymous visitors have no cached session at all — bounce to login
+  // immediately, without waiting on the dashboard data fetch.
+  useEffect(() => {
+    if (!apiClient.getCurrentUser()) {
+      router.push("/login");
+    }
+  }, [router]);
+
+  useEffect(() => {
+    let active = true;
+
+    (async () => {
+      try {
+        const res = await fetch('/api/referrals/analytics');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (active) setReferralData(data);
+      } catch {
+        // Ignore analytics fetch errors and let the dashboard keep rendering.
+      } finally {
+        if (active) setReferralLoading(false);
+      }
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // Once we know who the user is (from cache or a fresh fetch), make sure
+  // they're on the dashboard for their actual role.
+  useEffect(() => {
+    if (user && user.role !== "investor") {
+      router.push(`/dashboard/${user.role}`);
+    }
+  }, [user, router]);
+
+  const totalInvested = investments.reduce(
+    (s, i) => s + Number(i.amount_invested),
+    0,
+  );
+  const totalTokens = investments.reduce(
+    (s, i) => s + Number(i.token_holdings),
+    0,
+  );
+  const totalExpected = investments.reduce(
+    (s, i) => s + Number(i.expected_return_usd),
+    0,
+  );
+  const confirmed = investments.filter((i) => i.status === "confirmed").length;
+  // "Total Returns Paid" = returns actually disbursed (actual_return_usd is set
+  // once a deal pays out); distinct from the projected "Expected Returns".
+  const totalReturnsPaid = investments.reduce(
+    (s, i) => s + Number(i.actual_return_usd ?? 0),
+    0,
+  );
+
+  // A funded deal is "delayed" once it is past its target maturity (delivery)
+  // date but has not yet been delivered, completed, or failed.
+  const isDealDelayed = (deal: Investment["deal"]) => {
+    if (!deal.delivery_date) return false;
+    const due = new Date(deal.delivery_date).getTime();
+    if (Number.isNaN(due)) return false;
+    return (
+      Date.now() > due &&
+      !["delivered", "completed", "failed"].includes(deal.status)
+    );
+  };
+  const delayedCount = investments.filter((i) => isDealDelayed(i.deal)).length;
+
+  const filtered =
+    filter === "all"
+      ? investments
+      : investments.filter((i) => i.status === filter);
+
+  // Derive a portfolio-value-over-time trend from confirmed investments —
+  // running total of invested capital, ordered by when each was made.
+  const portfolioHistory = useMemo(() => {
+    let running = 0;
+    return investments
+      .filter((i) => i.status === "confirmed")
+      .slice()
+      .sort(
+        (a, b) =>
+          new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+      )
+      .map((i) => {
+        running += Number(i.amount_invested);
+        return { date: i.created_at, value: running };
+      });
+  }, [investments]);
+
+  const confirmedInvestments = investments.filter(
+    (i) => i.status === "confirmed",
+  );
+
+  if (!user) return null;
+
+  return (
+    <DashboardLayout user={user}>
+      <div className="page-content">
+        {/* Header */}
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <p className="text-sm text-slate-500 mb-1">Portfolio overview</p>
+            <h1 className="page-title">Investor Dashboard</h1>
+          </div>
+          <div className="flex gap-2">
+            <Link
+              href="/transparency"
+              className="btn-secondary flex-shrink-0 text-sm"
+            >
+              🔍 Transparency
+            </Link>
+            <Link href="/marketplace" className="btn-primary flex-shrink-0">
+              Browse Deals →
+            </Link>
+          </div>
+        </div>
+
+        {/* Offline indicator: shown when we're displaying last-cached data because
+            the latest background refresh failed (e.g. intermittent mobile network). */}
+        {isOffline && (
+          <div
+            role="status"
+            className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-4 py-2 text-xs font-medium text-slate-500"
+          >
+            <span
+              className="inline-block h-1.5 w-1.5 rounded-full bg-slate-400"
+              aria-hidden="true"
+            />
+            Viewing offline data — showing your last synced portfolio
+          </div>
+        )}
+
+        {/* Delayed-deal warning: surfaces deals past their target maturity date. */}
+        {delayedCount > 0 && (
+          <div
+            role="alert"
+            className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800"
+          >
+            ⚠️ {delayedCount} of your funded deal
+            {delayedCount !== 1 ? "s are" : " is"} past the target maturity date
+            and not yet delivered. Review the flagged positions below.
+          </div>
+        )}
+
+        {/* Stats */}
+        <div data-tour="portfolio-stats" className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3 md:gap-4">
+          <DualCurrencyStatCard
+            label="Total Investment Value"
+            usdValue={totalInvested}
+            icon="💰"
+            color="bg-violet-50"
+            localCurrency={
+              user?.preferredCurrency !== "USD"
+                ? user?.preferredCurrency
+                : undefined
+            }
+            localValue={
+              user?.preferredCurrency && user?.preferredCurrency !== "USD"
+                ? convert(totalInvested)?.localAmount
+                : undefined
+            }
+            rateDisclaimer={
+              lastUpdated
+                ? `Updated ${new Date(lastUpdated).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "UTC" })} UTC`
+                : undefined
+            }
+          />
+          <StatCard
+            label="Active Deals Funded"
+            value={confirmed}
+            icon="✅"
+            color="bg-emerald-50"
+          />
+          <StatCard
+            label="Total Returns Paid"
+            value={totalReturnsPaid}
+            isCurrency
+            currency="USD"
+            icon="💵"
+            color="bg-teal-50"
+          />
+          <StatCard
+            label="Total Tokens"
+            value={totalTokens}
+            icon="🪙"
+            color="bg-blue-50"
+          />
+          <StatCard
+            label="Expected Returns"
+            value={totalExpected}
+            isCurrency
+            currency="USD"
+            icon="📈"
+            color="bg-amber-50"
+            trend={
+              totalInvested > 0
+                ? `${((totalExpected / totalInvested - 1) * 100).toFixed(1)}% ROI`
+                : undefined
+            }
+            trendUp={totalExpected > totalInvested}
+          />
+        </div>
+
+        <ReferralDashboard data={referralData} loading={referralLoading} />
+
+        {/* Tabs */}
+        <div className="flex gap-1 bg-slate-100 rounded-xl p-1 w-fit">
+          {(
+            [
+              { key: "portfolio", label: "📊 Portfolio" },
+              { key: "certificates", label: "🏆 Certificates" },
+              { key: "fiat", label: "💱 Fiat / USDC" },
+            ] as { key: Tab; label: string }[]
+          ).map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              className={`px-4 py-2 rounded-lg text-sm font-semibold transition-all ${
+                tab === t.key
+                  ? "bg-white shadow-sm text-slate-900"
+                  : "text-slate-500 hover:text-slate-700"
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        {/* ── Portfolio tab ── */}
+        {tab === "portfolio" && (
+          <>
+            {!loading && investments.length > 0 && (
+              <PortfolioChart data={portfolioHistory} />
+            )}
+
+            {investments.length > 0 && (
+              <div className="flex gap-1 bg-slate-100 rounded-xl p-1 w-fit">
+                {(["all", "confirmed", "pending"] as const).map((f) => (
+                  <button
+                    key={f}
+                    onClick={() => setFilter(f)}
+                    className={`px-4 py-2 rounded-lg text-sm font-semibold capitalize transition-all ${
+                      filter === f
+                        ? "bg-white shadow-sm text-slate-900"
+                        : "text-slate-500 hover:text-slate-700"
+                    }`}
+                  >
+                    {f}
+                    <span className="ml-1.5 text-xs text-slate-400">
+                      (
+                      {f === "all"
+                        ? investments.length
+                        : investments.filter((i) => i.status === f).length}
+                      )
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {loading ? (
+              <div className="grid sm:grid-cols-2 md:grid-cols-2 lg:grid-cols-3 gap-5">
+                {[1, 2, 3].map((i) => (
+                  <div key={i} className="card h-56 skeleton" />
+                ))}
+              </div>
+            ) : investments.length === 0 ? (
+              <div className="card p-14 text-center">
+                <div className="w-16 h-16 rounded-3xl bg-violet-50 flex items-center justify-center text-3xl mx-auto mb-5">
+                  💼
+                </div>
+                <h3 className="font-bold text-slate-900 text-lg mb-2">
+                  No investments yet
+                </h3>
+                <p className="text-slate-500 text-sm mb-6 max-w-xs mx-auto">
+                  Browse the marketplace to find agricultural projects to fund
+                  and earn returns.
+                </p>
+                <Link href="/marketplace" className="btn-primary mx-auto">
+                  Browse Marketplace →
+                </Link>
+              </div>
+            ) : (
+              <div>
+                <div className="flex items-center justify-between mb-4">
+                  <h2 className="section-title">Your Portfolio</h2>
+                  <span className="muted">
+                    {filtered.length} investment
+                    {filtered.length !== 1 ? "s" : ""}
+                  </span>
+                </div>
+                <div className="grid sm:grid-cols-2 md:grid-cols-2 lg:grid-cols-3 gap-5">
+                  {filtered.map((inv) => {
+                    const pct =
+                      inv.deal.total_value > 0
+                        ? Math.min(
+                            (Number(inv.deal.funded_amount) /
+                              Number(inv.deal.total_value)) *
+                              100,
+                            100,
+                          )
+                        : 0;
+                    const isCompleted = inv.deal.status === "completed";
+                    const returnVal =
+                      isCompleted && inv.actual_return_usd != null
+                        ? Number(inv.actual_return_usd)
+                        : Number(inv.expected_return_usd);
+                    const returnLabel = isCompleted
+                      ? "Actual Return"
+                      : "Expected Return";
+
+                    return (
+                      <div
+                        key={inv.id}
+                        className="card-hover flex flex-col overflow-hidden"
+                      >
+                        <div
+                          className="h-1 bg-gradient-to-r from-violet-400 to-purple-500"
+                          style={{ width: `${pct}%` }}
+                        />
+                        <div className="p-5 flex flex-col gap-3 flex-1">
+                          <div className="flex items-start justify-between gap-2">
+                            <div>
+                              <h3 className="font-bold text-slate-900 capitalize">
+                                {inv.deal.commodity}
+                              </h3>
+                              <p className="text-xs text-slate-400 font-mono">
+                                {inv.deal.token_symbol}
+                              </p>
+                            </div>
+                            <div className="flex flex-col items-end gap-1">
+                              <span
+                                className={
+                                  INV_STATUS[inv.status] ?? "badge-gray"
+                                }
+                              >
+                                {inv.status}
+                              </span>
+                              <span
+                                className={
+                                  DEAL_STATUS[inv.deal.status] ?? "badge-gray"
+                                }
+                              >
+                                {inv.deal.status}
+                              </span>
+                              {isDealDelayed(inv.deal) && (
+                                <span
+                                  className="badge-red"
+                                  title={`Past target maturity date (${inv.deal.delivery_date})`}
+                                >
+                                  ⚠ Delayed
+                                </span>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-2">
+                            {[
+                              [
+                                "Invested",
+                                formatCurrency(inv.amount_invested, "USD", { decimalPlaces: 0 }),
+                                "text-violet-700",
+                              ],
+                              [
+                                "Tokens",
+                                formatNumber(inv.token_holdings),
+                                "",
+                              ],
+                              [
+                                returnLabel,
+                                formatCurrency(returnVal, "USD", { decimalPlaces: 0 }),
+                                isCompleted
+                                  ? "text-emerald-600"
+                                  : "text-blue-600",
+                              ],
+                              inv.return_percentage != null
+                                ? [
+                                    "ROI",
+                                    `${inv.return_percentage.toFixed(1)}%`,
+                                    inv.return_percentage >= 0
+                                      ? "text-emerald-600"
+                                      : "text-red-500",
+                                  ]
+                                : [
+                                    "Deal Value",
+                                    formatCurrency(inv.deal.total_value, "USD", { decimalPlaces: 0 }),
+                                    "",
+                                  ],
+                            ].map(([l, v, cls]) => (
+                              <div
+                                key={l}
+                                className="bg-slate-50 rounded-xl p-2.5"
+                              >
+                                <p className="text-[10px] text-slate-400 font-semibold uppercase tracking-wide">
+                                  {l}
+                                </p>
+                                <p
+                                  className={`text-sm font-bold mt-0.5 ${cls || "text-slate-900"}`}
+                                >
+                                  {v}
+                                </p>
+                              </div>
+                            ))}
+                          </div>
+
+                          <div className="space-y-1">
+                            <div className="flex justify-between text-xs">
+                              <span className="text-slate-500">
+                                Deal funding
+                              </span>
+                              <span className="font-bold text-violet-600">
+                                {pct.toFixed(1)}%
+                              </span>
+                            </div>
+                            <div className="progress-track">
+                              <div
+                                className="progress-purple"
+                                style={{ width: `${pct}%` }}
+                              />
+                            </div>
+                          </div>
+
+                          {/* Deal Health Indicators — Issue #1002 */}
+                          <DealHealthWidget dealId={inv.deal.id} compact />
+
+                          <div className="flex gap-2 mt-auto">
+                            <Link
+                              href={`/marketplace/${inv.deal.id}`}
+                              className="btn-secondary text-xs py-2 text-center flex-1"
+                            >
+                              View Deal →
+                            </Link>
+                            {inv.status === "confirmed" && (
+                              <button
+                                onClick={() => setTab("certificates")}
+                                className="btn-secondary text-xs py-2 px-3"
+                                title="View certificate"
+                              >
+                                🏆
+                              </button>
+                            )}
+                          </div>
+                          {inv.status === "pending" && (
+                            <CancelInvestmentButton
+                              investmentId={inv.id}
+                              status={inv.status}
+                              createdAt={inv.created_at}
+                              onCancelled={() => window.location.reload()}
+                            />
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        {/* ── Certificates tab ── */}
+        {tab === "certificates" && (
+          <div>
+            <div className="mb-6">
+              <h2 className="section-title">Investment Certificates</h2>
+              <p className="text-sm text-slate-500 mt-1">
+                Blockchain-verified proof of your investments. Each certificate
+                is backed by an immutable Stellar transaction.
+              </p>
+            </div>
+            {confirmedInvestments.length === 0 ? (
+              <div className="card p-14 text-center">
+                <div className="text-4xl mb-4">🏆</div>
+                <h3 className="font-bold text-slate-900 mb-2">
+                  No certificates yet
+                </h3>
+                <p className="text-slate-500 text-sm">
+                  Certificates are issued for confirmed investments.
+                </p>
+              </div>
+            ) : (
+              <div className="grid sm:grid-cols-2 md:grid-cols-2 lg:grid-cols-2 gap-6">
+                {confirmedInvestments.map((inv) => (
+                  <InvestmentCertificate
+                    key={inv.id}
+                    investmentId={inv.id}
+                    dealId={inv.trade_deal_id}
+                    commodity={inv.deal.commodity}
+                    tokenAmount={Number(inv.token_holdings)}
+                    amountUsd={Number(inv.amount_invested)}
+                    stellarTxId={inv.stellar_tx_id ?? null}
+                    sorobanContractId={inv.soroban_contract_id ?? null}
+                    investorAddress={user?.walletAddress ?? ""}
+                    createdAt={inv.created_at}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── Fiat / USDC tab ── */}
+        {tab === "fiat" && (
+          <div>
+            <div className="mb-6">
+              <h2 className="section-title">Fiat ↔ USDC</h2>
+              <p className="text-sm text-slate-500 mt-1">
+                Deposit local currency to get USDC for investing, or withdraw
+                your earnings back to your bank account via Stellar Anchors.
+              </p>
+            </div>
+            <div className="flex justify-center">
+              <AnchorWidget />
+            </div>
+          </div>
+        )}
+      </div>
+    </DashboardLayout>
+  );
+}

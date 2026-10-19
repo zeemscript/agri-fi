@@ -23,6 +23,8 @@ describe('EscrowService', () => {
   let mockDataSource: jest.Mocked<DataSource>;
 
   beforeEach(async () => {
+    jest.useFakeTimers();
+
     const mockManager = {
       findOne: jest.fn(),
       find: jest.fn(),
@@ -54,6 +56,7 @@ describe('EscrowService', () => {
 
     mockQueueService = {
       emit: jest.fn(),
+      enqueueDealCleanup: jest.fn().mockResolvedValue(undefined),
     } as any;
 
     mockConfigService = {
@@ -110,6 +113,10 @@ describe('EscrowService', () => {
     service = module.get<EscrowService>(EscrowService);
   });
 
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
   describe('processDealDelivered', () => {
     it('should successfully process escrow release and complete deal', async () => {
       const tradeDealId = 'deal-123';
@@ -157,7 +164,9 @@ describe('EscrowService', () => {
         (cb: (m: typeof mockManager) => Promise<unknown>) => cb(mockManager),
       );
       mockConfigService.get.mockReturnValue('platform-wallet');
-      mockStellarService.decryptSecret.mockReturnValue('decrypted-escrow-secret');
+      mockStellarService.decryptSecret.mockReturnValue(
+        'decrypted-escrow-secret',
+      );
       mockStellarService.releaseEscrow.mockResolvedValue(['stellar-tx-123']);
 
       await service.processDealDelivered(payload);

@@ -1,18 +1,23 @@
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { useWallet } from '../../hooks/useWallet';
 import { InvestmentForm } from '../InvestmentForm';
+import { ToastProvider } from '../ui/ToastProvider';
 import * as freighterApi from '@stellar/freighter-api';
 
+const renderWithToast = (ui: React.ReactElement) =>
+  render(<ToastProvider>{ui}</ToastProvider>);
+
 // Mock the useWallet hook
-jest.mock('../../hooks/useWallet', () => ({
-  useWallet: jest.fn(),
+vi.mock('../../hooks/useWallet', () => ({
+  useWallet: vi.fn(),
 }));
 
-const mockUseWallet = require('../../hooks/useWallet').useWallet as jest.Mock;
+const mockUseWallet = vi.mocked(useWallet);
 
 // Mock localStorage
 const mockLocalStorage = {
-  getItem: jest.fn(() => 'mock-auth-token'),
+  getItem: vi.fn(() => 'mock-auth-token'),
 };
 Object.defineProperty(window, 'localStorage', {
   value: mockLocalStorage,
@@ -23,8 +28,8 @@ describe('InvestmentForm', () => {
     dealId: 'deal-123',
     maxTokens: 50,
     tokenPrice: 100,
-    onSuccess: jest.fn(),
-    onError: jest.fn(),
+    onSuccess: vi.fn(),
+    onError: vi.fn(),
   };
 
   beforeEach(() => {
@@ -35,19 +40,19 @@ describe('InvestmentForm', () => {
     mockUseWallet.mockReturnValue({
       isConnected: true,
       publicKey: 'GTEST123...',
-      signTransaction: jest.fn(),
+      signTransaction: vi.fn(),
     });
   });
 
   it('validates token quantity input and shows calculated USD amount', async () => {
-    render(<InvestmentForm {...defaultProps} />);
+    renderWithToast(<InvestmentForm {...defaultProps} />);
 
-    const tokenInput = screen.getByLabelText('Number of Tokens');
+    const tokenInput = screen.getByLabelText(/Number of Tokens/);
     expect(tokenInput).toBeInTheDocument();
     expect(tokenInput).toHaveValue(1);
 
     // Check initial calculation
-    expect(screen.getByText('Token Price:')).toBeInTheDocument();
+    expect(screen.getByText('Price per lot:')).toBeInTheDocument();
     expect(screen.getByText('Quantity:')).toBeInTheDocument();
     expect(screen.getByText('Total Investment:')).toBeInTheDocument();
 
@@ -62,49 +67,38 @@ describe('InvestmentForm', () => {
     expect(screen.getByText('Invest $500')).toBeInTheDocument();
   });
 
-  it('enforces minimum and maximum token limits', async () => {
-    render(<InvestmentForm {...defaultProps} />);
+  it('shows inline quantity errors and focuses the field on invalid submit', async () => {
+    renderWithToast(<InvestmentForm {...defaultProps} />);
 
-    const tokenInput = screen.getByLabelText('Number of Tokens');
+    const tokenInput = screen.getByLabelText(/Number of Tokens/);
     const submitButton = screen.getByRole('button', { name: /Invest/ });
 
-    // Test below minimum
     fireEvent.change(tokenInput, { target: { value: '0' } });
-    
-    await waitFor(() => {
-      expect(submitButton).toBeDisabled();
-    });
+    fireEvent.blur(tokenInput);
+    expect(screen.getByRole('alert')).toHaveTextContent('quantityMin');
+    expect(tokenInput).toHaveAttribute('aria-invalid', 'true');
+    expect(submitButton).toBeEnabled();
+    fireEvent.click(submitButton);
+    expect(tokenInput).toHaveFocus();
 
-    // Test above maximum
     fireEvent.change(tokenInput, { target: { value: '100' } });
-    
-    await waitFor(() => {
-      expect(submitButton).toBeDisabled();
-    });
+    fireEvent.blur(tokenInput);
+    expect(screen.getByRole('alert')).toHaveTextContent('quantityMax');
 
-    // Test valid range
     fireEvent.change(tokenInput, { target: { value: '25' } });
-    
-    await waitFor(() => {
-      expect(submitButton).not.toBeDisabled();
-    });
-
-    // Test edge case - exactly at max
-    fireEvent.change(tokenInput, { target: { value: '50' } });
-    
-    await waitFor(() => {
-      expect(submitButton).not.toBeDisabled();
-    });
+    fireEvent.blur(tokenInput);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByTestId('form-field-success-icon')).toBeInTheDocument();
   });
 
   it('shows wallet connection prompt when not connected', () => {
     mockUseWallet.mockReturnValue({
       isConnected: false,
       publicKey: null,
-      signTransaction: jest.fn(),
+      signTransaction: vi.fn(),
     });
 
-    render(<InvestmentForm {...defaultProps} />);
+    renderWithToast(<InvestmentForm {...defaultProps} />);
 
     expect(screen.getByText(/Please connect your Stellar wallet to invest/)).toBeInTheDocument();
     expect(screen.queryByLabelText('Number of Tokens')).not.toBeInTheDocument();
@@ -112,7 +106,7 @@ describe('InvestmentForm', () => {
 
   it('handles successful investment flow', async () => {
     const user = userEvent.setup();
-    const mockSignTransaction = jest.fn().mockResolvedValue('signed-xdr-123');
+    const mockSignTransaction = vi.fn().mockResolvedValue('signed-xdr-123');
     
     mockUseWallet.mockReturnValue({
       isConnected: true,
@@ -138,9 +132,9 @@ describe('InvestmentForm', () => {
         }),
       });
 
-    render(<InvestmentForm {...defaultProps} />);
+    renderWithToast(<InvestmentForm {...defaultProps} />);
 
-    const tokenInput = screen.getByLabelText('Number of Tokens');
+    const tokenInput = screen.getByLabelText(/Number of Tokens/);
     const submitButton = screen.getByRole('button', { name: /Invest/ });
 
     // Set token quantity using fireEvent
@@ -185,7 +179,7 @@ describe('InvestmentForm', () => {
       json: async () => ({ message: 'Insufficient tokens available' }),
     });
 
-    render(<InvestmentForm {...defaultProps} />);
+    renderWithToast(<InvestmentForm {...defaultProps} />);
 
     const submitButton = screen.getByRole('button', { name: /Invest/ });
     await user.click(submitButton);
@@ -199,7 +193,7 @@ describe('InvestmentForm', () => {
 
   it('handles Freighter signing error', async () => {
     const user = userEvent.setup();
-    const mockSignTransaction = jest.fn().mockRejectedValue(new Error('User rejected transaction'));
+    const mockSignTransaction = vi.fn().mockRejectedValue(new Error('User rejected transaction'));
     
     mockUseWallet.mockReturnValue({
       isConnected: true,
@@ -217,7 +211,7 @@ describe('InvestmentForm', () => {
       }),
     });
 
-    render(<InvestmentForm {...defaultProps} />);
+    renderWithToast(<InvestmentForm {...defaultProps} />);
 
     const submitButton = screen.getByRole('button', { name: /Invest/ });
     await user.click(submitButton);
@@ -231,7 +225,7 @@ describe('InvestmentForm', () => {
     const user = userEvent.setup();
     mockLocalStorage.getItem.mockReturnValueOnce(null);
 
-    render(<InvestmentForm {...defaultProps} />);
+    renderWithToast(<InvestmentForm {...defaultProps} />);
 
     const submitButton = screen.getByRole('button', { name: /Invest/ });
     await user.click(submitButton);
@@ -243,7 +237,7 @@ describe('InvestmentForm', () => {
 
   it('allows making another investment after success', async () => {
     const user = userEvent.setup();
-    const mockSignTransaction = jest.fn().mockResolvedValue('signed-xdr-123');
+    const mockSignTransaction = vi.fn().mockResolvedValue('signed-xdr-123');
     
     mockUseWallet.mockReturnValue({
       isConnected: true,
@@ -257,7 +251,7 @@ describe('InvestmentForm', () => {
         json: async () => ({ stellarTxId: 'stellar-tx-456' }),
       });
 
-    render(<InvestmentForm {...defaultProps} />);
+    renderWithToast(<InvestmentForm {...defaultProps} />);
 
     const submitButton = screen.getByRole('button', { name: /Invest/ });
     await user.click(submitButton);
@@ -270,7 +264,7 @@ describe('InvestmentForm', () => {
     await user.click(anotherInvestmentButton);
 
     // Should return to form
-    expect(screen.getByLabelText('Number of Tokens')).toBeInTheDocument();
+    expect(screen.getByLabelText(/Number of Tokens/)).toBeInTheDocument();
     expect(screen.queryByText('Investment Successful!')).not.toBeInTheDocument();
   });
 });

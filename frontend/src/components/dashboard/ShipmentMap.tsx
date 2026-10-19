@@ -1,7 +1,31 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { getAuthToken } from '@/lib/auth-token';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import dynamic from 'next/dynamic';
 import 'leaflet/dist/leaflet.css';
+
+// Dynamically import Leaflet components to avoid SSR issues
+const MapContainer = dynamic(
+  () => import('react-leaflet').then((mod) => mod.MapContainer),
+  { ssr: false },
+);
+const TileLayer = dynamic(
+  () => import('react-leaflet').then((mod) => mod.TileLayer),
+  { ssr: false },
+);
+const CircleMarker = dynamic(
+  () => import('react-leaflet').then((mod) => mod.CircleMarker),
+  { ssr: false },
+);
+const Popup = dynamic(
+  () => import('react-leaflet').then((mod) => mod.Popup),
+  { ssr: false },
+);
+const Polyline = dynamic(
+  () => import('react-leaflet').then((mod) => mod.Polyline),
+  { ssr: false },
+);
 
 type MilestoneType = 'farm' | 'warehouse' | 'port' | 'importer';
 
@@ -18,32 +42,30 @@ interface ShipmentMapProps {
   className?: string;
 }
 
+/** Colour each milestone stage for quick visual identification */
+const MILESTONE_COLOR: Record<MilestoneType, string> = {
+  farm: '#16a34a',       // green-600
+  warehouse: '#2563eb',  // blue-600
+  port: '#d97706',       // amber-600
+  importer: '#7c3aed',   // violet-600
+};
+
+const DEFAULT_COLOR = '#6b7280'; // gray-500
+
 export const ShipmentMap: React.FC<ShipmentMapProps> = ({
   tradeDealId,
   className = '',
 }) => {
-  const mapDivRef = useRef<HTMLDivElement | null>(null);
-  const mapRef = useRef<any>(null);
-  const layerRef = useRef<any>(null);
-
   const [milestones, setMilestones] = useState<Milestone[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-
-  const points = useMemo(
-    () =>
-      milestones
-        .filter((m) => typeof m.latitude === 'number' && typeof m.longitude === 'number')
-        .map((m) => ({ ...m, lat: m.latitude as number, lng: m.longitude as number })),
-    [milestones],
-  );
 
   const fetchMilestones = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
 
-      const token = localStorage.getItem('auth_token');
+      const token = getAuthToken();
       if (!token) throw new Error('Authentication required');
 
       const res = await fetch(`/api/shipments/${tradeDealId}`, {
@@ -61,14 +83,14 @@ export const ShipmentMap: React.FC<ShipmentMapProps> = ({
           typeof m.latitude === 'number'
             ? m.latitude
             : m.latitude
-              ? Number(m.latitude)
-              : null,
+            ? Number(m.latitude)
+            : null,
         longitude:
           typeof m.longitude === 'number'
             ? m.longitude
             : m.longitude
-              ? Number(m.longitude)
-              : null,
+            ? Number(m.longitude)
+            : null,
       }));
 
       setMilestones(normalized);
@@ -83,70 +105,36 @@ export const ShipmentMap: React.FC<ShipmentMapProps> = ({
     fetchMilestones();
   }, [fetchMilestones]);
 
-  useEffect(() => {
-    let isMounted = true;
+  const points = useMemo(
+    () =>
+      milestones
+        .filter(
+          (m) =>
+            typeof m.latitude === 'number' && typeof m.longitude === 'number',
+        )
+        .map((m) => ({
+          ...m,
+          lat: m.latitude as number,
+          lng: m.longitude as number,
+        })),
+    [milestones],
+  );
 
-    (async () => {
-      if (!mapDivRef.current) return;
+  const center: [number, number] =
+    points.length > 0
+      ? [points[points.length - 1].lat, points[points.length - 1].lng]
+      : [0, 0];
 
-      const L = await import('leaflet');
-      if (!isMounted) return;
-
-      if (!mapRef.current) {
-        mapRef.current = L.map(mapDivRef.current, {
-          zoomControl: true,
-          attributionControl: true,
-        });
-
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-          attribution: '&copy; OpenStreetMap contributors',
-        }).addTo(mapRef.current);
-      }
-
-      if (layerRef.current) {
-        layerRef.current.remove();
-      }
-
-      layerRef.current = L.layerGroup().addTo(mapRef.current);
-
-      if (points.length === 0) {
-        mapRef.current.setView([0, 0], 2);
-        return;
-      }
-
-      const latlngs = points.map((p) => [p.lat, p.lng] as [number, number]);
-      const bounds = L.latLngBounds(latlngs);
-
-      points.forEach((p) => {
-        L.circleMarker([p.lat, p.lng], {
-          radius: 7,
-          color: '#16a34a',
-          weight: 2,
-          fillColor: '#22c55e',
-          fillOpacity: 0.85,
-        })
-          .bindPopup(`${p.milestone.toUpperCase()}`)
-          .addTo(layerRef.current);
-      });
-
-      if (latlngs.length >= 2) {
-        L.polyline(latlngs, { color: '#2563eb', weight: 3, opacity: 0.85 }).addTo(
-          layerRef.current,
-        );
-      }
-
-      mapRef.current.fitBounds(bounds.pad(0.2));
-    })();
-
-    return () => {
-      isMounted = false;
-    };
-  }, [points]);
+  const polylinePoints = points.map((p) => [p.lat, p.lng] as [number, number]);
 
   if (loading) {
     return (
-      <div className={`bg-white rounded-2xl shadow-sm border border-gray-100 p-6 ${className}`}>
-        <h3 className="text-lg font-semibold text-gray-900 mb-2">Shipment Map</h3>
+      <div
+        className={`bg-white rounded-2xl shadow-sm border border-gray-100 p-6 ${className}`}
+      >
+        <h3 className="text-lg font-semibold text-gray-900 mb-2">
+          Shipment Map
+        </h3>
         <p className="text-sm text-gray-400 animate-pulse">Loading map…</p>
       </div>
     );
@@ -154,11 +142,13 @@ export const ShipmentMap: React.FC<ShipmentMapProps> = ({
 
   if (error) {
     return (
-      <div className={`bg-red-50 border border-red-200 rounded-lg p-4 ${className}`}>
-        <p className="text-red-800 text-sm">{error}</p>
+      <div
+        className={`bg-red-50 border border-red-200 rounded-lg p-4 ${className}`}
+      >
+        <p className="text-red-800 text-sm font-medium">{error}</p>
         <button
           onClick={fetchMilestones}
-          className="mt-2 text-sm text-red-600 hover:text-red-800 underline"
+          className="mt-2 text-sm text-red-600 hover:text-red-800 underline font-semibold"
         >
           Try again
         </button>
@@ -167,25 +157,120 @@ export const ShipmentMap: React.FC<ShipmentMapProps> = ({
   }
 
   return (
-    <div className={`bg-white rounded-2xl shadow-sm border border-gray-100 p-6 ${className}`}>
-      <div className="flex items-center justify-between mb-2">
-        <h3 className="text-lg font-semibold text-gray-900">Shipment Map</h3>
+    <div
+      className={`bg-white rounded-2xl shadow-sm border border-gray-100 p-6 ${className}`}
+    >
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          <h3 className="text-lg font-semibold text-gray-900">Shipment Map</h3>
+          <p className="text-xs text-gray-500 mt-0.5">
+            Physical journey of the produce
+          </p>
+        </div>
         <button
           onClick={fetchMilestones}
-          className="text-xs text-gray-500 hover:text-gray-700 underline"
+          className="text-xs font-semibold text-brand-600 hover:text-brand-700 bg-brand-50 px-2 py-1 rounded-md transition-colors"
         >
-          Refresh
+          Refresh Data
         </button>
       </div>
 
       {points.length === 0 ? (
-        <div className="text-sm text-gray-500">
+        <div className="text-sm text-gray-500 bg-gray-50 rounded-xl p-8 text-center border border-dashed border-gray-200">
+          <p className="text-2xl mb-2">📍</p>
           No milestone coordinates recorded yet.
         </div>
       ) : (
-        <div ref={mapDivRef} className="h-72 w-full rounded-xl overflow-hidden" />
+        <>
+          {/* Milestone colour legend */}
+          <div className="flex flex-wrap gap-3 mb-3">
+            {(
+              Object.entries(MILESTONE_COLOR) as [MilestoneType, string][]
+            ).map(([key, color]) => (
+              <span key={key} className="flex items-center gap-1 text-xs text-gray-600">
+                <span
+                  className="inline-block w-3 h-3 rounded-full"
+                  style={{ backgroundColor: color }}
+                  aria-hidden="true"
+                />
+                <span className="capitalize">{key}</span>
+              </span>
+            ))}
+          </div>
+
+          {/*
+           * preferCanvas={true} instructs Leaflet to use an HTML5 <canvas>
+           * element for rendering vector layers (CircleMarker, Polyline) instead
+           * of individual SVG/DOM nodes.  This dramatically reduces DOM size and
+           * improves rendering performance when there are many markers.
+           *
+           * CircleMarker is a native Leaflet canvas-compatible layer — unlike
+           * Marker + divIcon which always creates a DOM element per marker.
+           */}
+          <div className="h-[400px] w-full rounded-xl overflow-hidden border border-gray-200 shadow-inner relative z-0">
+            <MapContainer
+              center={center}
+              zoom={4}
+              scrollWheelZoom={false}
+              className="h-full w-full"
+              style={{ minHeight: '100%' }}
+              preferCanvas={true}
+            >
+              <TileLayer
+                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+              />
+
+              {points.map((p) => {
+                const fillColor =
+                  MILESTONE_COLOR[p.milestone] ?? DEFAULT_COLOR;
+                return (
+                  <CircleMarker
+                    key={p.id}
+                    center={[p.lat, p.lng]}
+                    radius={8}
+                    pathOptions={{
+                      fillColor,
+                      fillOpacity: 1,
+                      color: '#ffffff',
+                      weight: 2,
+                    }}
+                  >
+                    <Popup>
+                      <div className="text-xs font-semibold uppercase">
+                        {p.milestone}
+                      </div>
+                      <div className="text-[10px] text-gray-500">
+                        {new Date(p.recordedAt).toLocaleString()}
+                      </div>
+                    </Popup>
+                  </CircleMarker>
+                );
+              })}
+
+              {polylinePoints.length >= 2 && (
+                <Polyline
+                  positions={polylinePoints}
+                  color="#2563eb"
+                  weight={3}
+                  opacity={0.7}
+                  dashArray="5, 10"
+                />
+              )}
+            </MapContainer>
+          </div>
+        </>
       )}
+
+      <style jsx global>{`
+        .leaflet-container {
+          width: 100%;
+          height: 100%;
+        }
+        .leaflet-control-container .leaflet-top {
+          z-index: 10;
+        }
+      `}</style>
     </div>
   );
 };
-

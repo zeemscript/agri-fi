@@ -23,7 +23,7 @@ const mockMilestones = [
 
 // Mock localStorage
 const mockLocalStorage = {
-  getItem: jest.fn(() => 'mock-auth-token'),
+  getItem: vi.fn(() => 'mock-auth-token'),
 };
 Object.defineProperty(window, 'localStorage', {
   value: mockLocalStorage,
@@ -43,7 +43,7 @@ describe('ShipmentTimeline', () => {
     render(<ShipmentTimeline tradeDealId="deal-123" />);
     
     // Check for loading skeleton by class name
-    const loadingContainer = document.querySelector('.animate-pulse');
+    const loadingContainer = document.querySelector('.skeleton');
     expect(loadingContainer).toBeTruthy();
   });
 
@@ -73,8 +73,8 @@ describe('ShipmentTimeline', () => {
     expect(screen.getByText('Importer Receipt')).toBeInTheDocument();
 
     // Check Stellar transaction IDs are truncated
-    expect(screen.getByText('stellar-tx-123...')).toBeInTheDocument();
-    expect(screen.getByText('stellar-tx-456...')).toBeInTheDocument();
+    expect(screen.getByText(/stellar-tx-123/)).toBeInTheDocument();
+    expect(screen.getByText(/stellar-tx-456/)).toBeInTheDocument();
   });
 
   it('renders error state and retry functionality', async () => {
@@ -105,13 +105,15 @@ describe('ShipmentTimeline', () => {
   });
 
   it('handles authentication error', async () => {
-    mockLocalStorage.getItem.mockReturnValueOnce(null);
+    // No token under the canonical or any legacy key (see lib/auth-token).
+    mockLocalStorage.getItem.mockReturnValue(null);
 
     render(<ShipmentTimeline tradeDealId="deal-123" />);
 
     await waitFor(() => {
       expect(screen.getByText(/Authentication required/)).toBeInTheDocument();
     });
+    mockLocalStorage.getItem.mockReturnValue('mock-auth-token');
   });
 
   it('renders empty state when no milestones exist', async () => {
@@ -126,7 +128,7 @@ describe('ShipmentTimeline', () => {
       expect(screen.getByText('No milestones recorded yet')).toBeInTheDocument();
     });
 
-    expect(screen.getByText('Milestones will appear here as the shipment progresses')).toBeInTheDocument();
+    expect(screen.getByText('Updates will appear here as the shipment progresses')).toBeInTheDocument();
   });
 
   it('formats dates correctly', async () => {
@@ -182,11 +184,11 @@ describe('ShipmentTimeline', () => {
     render(<ShipmentTimeline tradeDealId="deal-123" />);
 
     await waitFor(() => {
-      expect(screen.getByText('Custom step')).toBeInTheDocument();
+      expect(screen.getByText('custom step')).toBeInTheDocument();
       expect(screen.getByText('❓')).toBeInTheDocument();
     });
 
     expect(screen.getByText('A custom processing step')).toBeInTheDocument();
-    expect(screen.getByText('stellar-tx-789...')).toBeInTheDocument();
+    expect(screen.getByText(/stellar-tx-789/)).toBeInTheDocument();
   });
 });

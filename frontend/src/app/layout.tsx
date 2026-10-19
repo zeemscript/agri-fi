@@ -1,11 +1,37 @@
 import type { Metadata } from "next";
 import "./globals.css";
-import { WalletButton } from "../components/WalletButton";
-import { LanguageSwitcher } from "../components/LanguageSwitcher";
+import { ThemeProvider } from "@/components/ThemeProvider";
+import { ThemeToggle } from "@/components/ThemeToggle";
+import { ToastProvider } from "@/components/ui/ToastProvider";
+import { PWAInstallBanner } from "@/components/PWAInstallBanner";
 
 export const metadata: Metadata = {
-  title: "Agric-onchain Finance",
-  description: "Blockchain-backed agricultural trade finance platform",
+  title: "AgriFi — Agricultural Finance Platform",
+  description: "Fund farming projects, earn returns, and buy produce on-chain.",
+  manifest: "/manifest.json",
+  viewport:
+    "width=device-width, initial-scale=1, maximum-scale=5, viewport-fit=cover",
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "black-translucent",
+    title: "AgriFi",
+  },
+  formatDetection: {
+    telephone: false,
+  },
+  icons: {
+    icon: "/icon-192.png",
+    apple: ["/icon-192.png", { url: "/icon-512.png", sizes: "512x512" }],
+  },
+  other: {
+    "apple-mobile-web-app-capable": "yes",
+    "apple-mobile-web-app-status-bar-style": "black-translucent",
+    "apple-mobile-web-app-title": "AgriFi",
+    "mobile-web-app-capable": "yes",
+    "theme-color": "#1f2937",
+    "msapplication-TileColor": "#1f2937",
+    "msapplication-config": "/browserconfig.xml",
+  },
 };
 
 export default function RootLayout({
@@ -14,24 +40,38 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        {/* PWA: Service Worker Registration */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              if ('serviceWorker' in navigator) {
+                navigator.serviceWorker.register('/sw.js', { scope: '/' })
+                  .then(reg => console.log('Service Worker registered:', reg))
+                  .catch(err => console.error('Service Worker registration failed:', err));
+              }
+            `,
+          }}
+        />
+      </head>
       <body>
-        <nav className="bg-white shadow-sm border-b">
-          <div className="container mx-auto px-4">
-            <div className="flex justify-between items-center h-16">
-              <div className="flex items-center">
-                <h1 className="text-xl font-bold text-green-800">
-                  Agric-onchain Finance
-                </h1>
-              </div>
-              <div className="flex items-center space-x-4">
-                <LanguageSwitcher />
-                <WalletButton />
+        <ThemeProvider
+          attribute="class"
+          defaultTheme="system"
+          enableSystem
+          disableTransitionOnChange
+        >
+          <ToastProvider>
+            <PWAInstallBanner />
+            <div className="pointer-events-none fixed right-4 top-4 z-[90] sm:right-6 sm:top-6">
+              <div className="pointer-events-auto">
+                <ThemeToggle />
               </div>
             </div>
-          </div>
-        </nav>
-        <main>{children}</main>
+            {children}
+          </ToastProvider>
+        </ThemeProvider>
       </body>
     </html>
   );

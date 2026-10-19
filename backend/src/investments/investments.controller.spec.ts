@@ -2,14 +2,19 @@ import { ExecutionContext, ForbiddenException } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { APP_GUARD } from '@nestjs/core';
-import { RolesGuard } from '../auth/roles.guard';
+import { RolesGuard } from '../common/guards';
 import { InvestmentsController } from './investments.controller';
 import { InvestmentsService } from './investments.service';
 import { StellarService } from '../stellar/stellar.service';
 import { CreateInvestmentDto } from './dto/create-investment.dto';
 
+import { getRepositoryToken } from '@nestjs/typeorm';
+import { TradeDeal } from '../trade-deals/entities/trade-deal.entity';
+import { Investment } from './entities/investment.entity';
+
 const mockInvestmentsService = {
   createInvestment: jest.fn(),
+  confirmInvestment: jest.fn(),
 };
 
 const mockStellarService = {} as StellarService;
@@ -20,7 +25,7 @@ describe('InvestmentsController', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
-    
+
     // Create a test module with throttler to verify it's applied
     const { Test } = await import('@nestjs/testing');
     const module = await Test.createTestingModule({
@@ -29,6 +34,8 @@ describe('InvestmentsController', () => {
       providers: [
         { provide: InvestmentsService, useValue: mockInvestmentsService },
         { provide: StellarService, useValue: mockStellarService },
+        { provide: getRepositoryToken(TradeDeal), useValue: {} },
+        { provide: getRepositoryToken(Investment), useValue: {} },
         { provide: APP_GUARD, useClass: ThrottlerGuard },
       ],
     }).compile();
@@ -71,6 +78,29 @@ describe('InvestmentsController', () => {
     expect(mockInvestmentsService.createInvestment).not.toHaveBeenCalled();
   });
 
+  describe('POST /investments/:id/confirm', () => {
+    it('delegates confirmation to the service with the authenticated user id', async () => {
+      const request = { user: { id: 'investor-1' } };
+      const stellarTxId =
+        'a1b2c3d4e5f67890abcdef1234567890abcdef1234567890abcdef1234567890';
+      const expected = { id: 'investment-1', status: 'confirmed' };
+      mockInvestmentsService.confirmInvestment.mockResolvedValue(expected);
+
+      const result = await controller.confirmInvestment(
+        request as any,
+        'investment-1',
+        stellarTxId,
+      );
+
+      expect(result).toEqual(expected);
+      expect(mockInvestmentsService.confirmInvestment).toHaveBeenCalledWith(
+        'investor-1',
+        'investment-1',
+        stellarTxId,
+      );
+    });
+  });
+
   describe('POST /investments', () => {
     it('should have throttler guard applied with 5 requests per minute', async () => {
       const request = { user: { id: 'investor-1', role: 'investor' } };
@@ -89,6 +119,36 @@ describe('InvestmentsController', () => {
         'investor-1',
         dto,
       );
+    });
+  });
+
+  describe('GET /investments/buy-orders/:tokenCode/:tokenIssuer', () => {
+    it('is protected by AuthGuard', () => {
+      const guards =
+        Reflect.getMetadata(
+          '__guards__',
+          InvestmentsController.prototype.getActiveBuyOrders,
+        ) ?? [];
+
+      // The guard list must be non-empty, proving the method has its own
+      // AuthGuard and does not rely solely on the class-level decorator.
+      expect(guards.length).toBeGreaterThan(0);
+    });
+
+    it('delegates to StellarService when the request is authenticated', async () => {
+      const mockOffers = [
+        { offerId: '1', buyer: 'GBUYER...', amount: '100', price: '1.05' },
+      ];
+      (mockStellarService as any).getActiveBuyOrdersForToken = jest
+        .fn()
+        .mockResolvedValue(mockOffers);
+
+      const result = await controller.getActiveBuyOrders('AGRI', 'GISSUER123');
+
+      expect(
+        (mockStellarService as any).getActiveBuyOrdersForToken,
+      ).toHaveBeenCalledWith('AGRI', 'GISSUER123');
+      expect(result).toEqual(mockOffers);
     });
   });
 });
