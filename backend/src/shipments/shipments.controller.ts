@@ -9,6 +9,7 @@ import {
   HttpCode,
   HttpStatus,
   ForbiddenException,
+  Version,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -20,7 +21,10 @@ import {
 import { AuthGuard } from '@nestjs/passport';
 import { ShipmentsService } from './shipments.service';
 import { CreateMilestoneDto } from './dto/create-milestone.dto';
+import { CreateSensorReadingsDto } from './dto/create-sensor-readings.dto';
+import { SensorReadingsService } from './sensor-readings.service';
 import { User } from '../auth/entities/user.entity';
+import { TradeDealsGuard } from '../trade-deals/trade-deals.guard';
 
 interface AuthRequest extends Request {
   user: User;
@@ -29,15 +33,20 @@ interface AuthRequest extends Request {
 @ApiTags('shipments')
 @ApiBearerAuth('jwt')
 @UseGuards(AuthGuard('jwt'))
-@Controller('shipments')
+@Controller({ path: 'shipments', version: '1' })
 export class ShipmentsController {
-  constructor(private readonly shipmentsService: ShipmentsService) {}
+  constructor(
+    private readonly shipmentsService: ShipmentsService,
+    private readonly sensorReadingsService: SensorReadingsService,
+  ) {}
 
   @Get(':trade_deal_id')
+  @UseGuards(TradeDealsGuard)
   @ApiOperation({ summary: 'List shipment milestones for a trade deal' })
   @ApiParam({ name: 'trade_deal_id', description: 'Trade deal UUID' })
   @ApiResponse({ status: 200, description: 'Ordered list of milestones' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 403, description: 'Forbidden' })
   @ApiResponse({ status: 404, description: 'Trade deal not found' })
   async getMilestonesByDeal(@Param('trade_deal_id') tradeDealId: string) {
     return this.shipmentsService.findByDeal(tradeDealId);
@@ -69,5 +78,32 @@ export class ShipmentsController {
       });
     }
     return this.shipmentsService.recordMilestone(user.id, dto);
+  }
+
+  @Post(':id/sensor-readings')
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({
+    summary: 'Ingest a batch of IoT sensor readings for a shipment (#849)',
+  })
+  @ApiParam({ name: 'id', description: 'Trade deal / shipment UUID' })
+  @ApiResponse({
+    status: 201,
+    description: 'Readings saved; returns count and alert count',
+  })
+  @ApiResponse({ status: 400, description: 'Validation error or empty batch' })
+  @ApiResponse({ status: 404, description: 'Shipment not found' })
+  async ingestSensorReadings(
+    @Param('id') id: string,
+    @Body() dto: CreateSensorReadingsDto,
+  ) {
+    return this.sensorReadingsService.ingestBatch(id, dto);
+  }
+
+  @Get(':id/sensor-readings')
+  @ApiOperation({ summary: 'List sensor readings for a shipment' })
+  @ApiParam({ name: 'id', description: 'Trade deal / shipment UUID' })
+  @ApiResponse({ status: 200, description: 'Ordered list of sensor readings' })
+  async getSensorReadings(@Param('id') id: string) {
+    return this.sensorReadingsService.findByShipment(id);
   }
 }

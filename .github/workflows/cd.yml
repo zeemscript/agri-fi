@@ -1,0 +1,486 @@
+name: CD — Staging
+
+# Continuous deployment: on every merge to main, build and push the backend and
+# frontend Docker images to GHCR, then roll the new image tags out to the
+# staging Kubernetes cluster.
+#
+# Required configuration:
+#   * Built-in GITHUB_TOKEN (with packages: write) is used to push to GHCR.
+#   * Secret KUBE_CONFIG_STAGING — base64-encoded kubeconfig for the staging
+#     cluster. Create with: `base64 -w0 ~/.kube/config` (Linux) and store it as
+#     a repository/environment secret.
+#   * Database migrations run automatically before deployment using the new
+#     backend image. The migration pod requires database connection credentials
+#     configured in the Kubernetes environment (via ConfigMaps/Secrets).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never let two staging deploys race each other.
+concurrency:
+  group: cd-staging
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve image coordinates
+    runs-on: ubuntu-latest
+    outputs:
+      image_prefix: ${{ steps.vars.outputs.image_prefix }}
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - id: vars
+        run: |
+          # GHCR requires a lowercase image path.
+          echo "image_prefix=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          # Discord notification
+          if [ -n "${{ secrets.DISCORD_WEBHOOK_URL }}" ]; then
+            curl -X POST ${{ secrets.DISCORD_WEBHOOK_URL }} \
+              -H "Content-Type: application/json" \
+              -d '{
+                "content": "❌ **CD Prepare Job Failed**\n\n**Repository:** ${{ github.repository }}\n**Branch:** ${{ github.ref_name }}\n**Commit:** ${{ github.sha }}\n**Actor:** ${{ github.actor }}\n**Workflow:** ${{ github.workflow }}\n**Job:** prepare\n**Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                "username": "GitHub Actions"
+              }' || true
+          fi
+
+          # Slack notification
+          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
+              -H "Content-Type: application/json" \
+              -d '{
+                "text": "❌ CD Prepare Job Failed",
+                "blocks": [
+                  {
+                    "type": "header",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "❌ CD Prepare Job Failed"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "fields": [
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Repository:*\n${{ github.repository }}"
+                      },
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Branch:*\n${{ github.ref_name }}"
+                      },
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Commit:*\n${{ github.sha }}"
+                      },
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Actor:*\n${{ github.actor }}"
+                      },
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Job:*\nprepare"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Workflow Run>"
+                    }
+                  }
+                ]
+              }' || true
+          fi
+
+  build:
+    name: Build & push ${{ matrix.component }} image
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        component: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.component }}
+          file: ./${{ matrix.component }}/Dockerfile
+          push: true
+          tags: |
+            ${{ needs.prepare.outputs.image_prefix }}/${{ matrix.component }}:${{ needs.prepare.outputs.tag }}
+            ${{ needs.prepare.outputs.image_prefix }}/${{ matrix.component }}:latest
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+
+      - name: Generate SBOM with syft
+        run: |
+          # Install syft
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+          # Generate SBOM in SPDX JSON format
+          syft "${{ needs.prepare.outputs.image_prefix }}/${{ matrix.component }}:${{ needs.prepare.outputs.tag }}" \
+            -o spdx-json > /tmp/sbom-${{ matrix.component }}.spdx.json
+
+          # Attach SBOM to image via annotation
+          echo "SBOM generated for ${{ matrix.component }}: /tmp/sbom-${{ matrix.component }}.spdx.json"
+
+      - name: Sign image and attach SBOM with cosign
+        env:
+          COSIGN_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          # Install cosign
+          curl -sSfL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 -o /usr/local/bin/cosign
+          chmod +x /usr/local/bin/cosign
+
+          # Write private key to temp file
+          echo "$COSIGN_KEY" > /tmp/cosign.key
+
+          IMAGE="${{ needs.prepare.outputs.image_prefix }}/${{ matrix.component }}:${{ needs.prepare.outputs.tag }}"
+
+          # Sign the image
+          cosign sign --key /tmp/cosign.key "$IMAGE"
+
+          # Attach SBOM as attestation
+          cosign attach attestation --attestation /tmp/sbom-${{ matrix.component }}.spdx.json "$IMAGE" || true
+
+          # Clean up
+          rm -f /tmp/cosign.key /tmp/sbom-${{ matrix.component }}.spdx.json
+
+      - name: Upload SBOM artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.component }}
+          path: /tmp/sbom-${{ matrix.component }}.spdx.json
+          retention-days: 90
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          # Discord notification
+          if [ -n "${{ secrets.DISCORD_WEBHOOK_URL }}" ]; then
+            curl -X POST ${{ secrets.DISCORD_WEBHOOK_URL }} \
+              -H "Content-Type: application/json" \
+              -d '{
+                "content": "❌ **CD Build Job Failed**\n\n**Repository:** ${{ github.repository }}\n**Branch:** ${{ github.ref_name }}\n**Commit:** ${{ github.sha }}\n**Actor:** ${{ github.actor }}\n**Workflow:** ${{ github.workflow }}\n**Job:** build\n**Component:** ${{ matrix.component }}\n**Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                "username": "GitHub Actions"
+              }' || true
+          fi
+
+          # Slack notification
+          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
+              -H "Content-Type: application/json" \
+              -d '{
+                "text": "❌ CD Build Job Failed",
+                "blocks": [
+                  {
+                    "type": "header",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "❌ CD Build Job Failed"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "fields": [
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Repository:*\n${{ github.repository }}"
+                      },
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Branch:*\n${{ github.ref_name }}"
+                      },
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Commit:*\n${{ github.sha }}"
+                      },
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Actor:*\n${{ github.actor }}"
+                      },
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Job:*\nbuild"
+                      },
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Component:*\n${{ matrix.component }}"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Workflow Run>"
+                    }
+                  }
+                ]
+              }' || true
+          fi
+
+  deploy:
+    name: Deploy to staging
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    environment: staging
+    outputs:
+      active_slot: ${{ steps.bluegreen.outputs.active }}
+      inactive_slot: ${{ steps.bluegreen.outputs.inactive }}
+    steps:
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > "$HOME/.kube/config"
+
+      - name: Run database migrations
+        env:
+          IMAGE_PREFIX: ${{ needs.prepare.outputs.image_prefix }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          echo "Running database migrations..."
+
+          # Create a temporary pod to run migrations against the same
+          # ConfigMap/Secret as the agri-fi-backend Deployment (backend/k8s/deployment.yaml),
+          # so migrations always target the database the app is about to use.
+          kubectl -n default run migration-runner-${GITHUB_SHA::12} \
+            --image="${IMAGE_PREFIX}/backend:${TAG}" \
+            --restart=Never \
+            --overrides='{
+              "spec": {
+                "containers": [
+                  {
+                    "name": "migration-runner",
+                    "image": "'"${IMAGE_PREFIX}/backend:${TAG}"'",
+                    "command": ["npm", "run", "migration:run"],
+                    "envFrom": [
+                      {"configMapRef": {"name": "agri-fi-backend-config"}},
+                      {"secretRef": {"name": "agri-fi-backend-secrets"}}
+                    ],
+                    "resources": {
+                      "requests": {"cpu": "250m", "memory": "256Mi"},
+                      "limits": {"cpu": "500m", "memory": "512Mi"}
+                    }
+                  }
+                ]
+              }
+            }'
+
+          # Wait for the migration pod to complete
+          kubectl -n default wait pod/migration-runner-${GITHUB_SHA::12} \
+            --for=condition=complete \
+            --timeout=300s
+
+          # Check if migration was successful
+          MIGRATION_STATUS=$(kubectl -n default get pod/migration-runner-${GITHUB_SHA::12} -o jsonpath='{.status.phase}')
+
+          # Clean up the migration pod
+          kubectl -n default delete pod migration-runner-${GITHUB_SHA::12} --ignore-not-found=true
+
+          if [ "$MIGRATION_STATUS" != "Succeeded" ]; then
+            echo "Migration failed with status: $MIGRATION_STATUS"
+            exit 1
+          fi
+
+          echo "Database migrations completed successfully"
+
+      # ── Blue-green deployment for the backend (#836) ────────────────────────
+      # The frontend keeps using a plain rolling update.
+
+      - name: Roll out frontend image tag
+        env:
+          IMAGE_PREFIX: ${{ needs.prepare.outputs.image_prefix }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          kubectl -n default set image deployment/agri-fi-frontend \
+            frontend="${IMAGE_PREFIX}/frontend:${TAG}"
+          kubectl -n default rollout status deployment/agri-fi-frontend --timeout=180s
+
+      - name: Determine active slot and deploy backend to inactive slot
+        id: bluegreen
+        env:
+          IMAGE_PREFIX: ${{ needs.prepare.outputs.image_prefix }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          ACTIVE=$(kubectl -n default get svc agri-fi-backend \
+            -o jsonpath='{.spec.selector.slot}')
+          if [ "$ACTIVE" = "green" ]; then INACTIVE=blue; else INACTIVE=green; fi
+          echo "Active slot: $ACTIVE — deploying new version to $INACTIVE"
+          echo "active=$ACTIVE" >> "$GITHUB_OUTPUT"
+          echo "inactive=$INACTIVE" >> "$GITHUB_OUTPUT"
+
+          kubectl -n default set image deployment/agri-fi-backend-$INACTIVE \
+            backend="${IMAGE_PREFIX}/backend:${TAG}"
+          kubectl -n default rollout status \
+            deployment/agri-fi-backend-$INACTIVE --timeout=180s
+
+      - name: Smoke test inactive slot (health + critical APIs)
+        run: |
+          SLOT=${{ steps.bluegreen.outputs.inactive }}
+
+          kubectl -n default delete svc agri-fi-backend-smoke --ignore-not-found=true
+          kubectl -n default create service clusterip agri-fi-backend-smoke --tcp=80:80
+          kubectl -n default patch svc agri-fi-backend-smoke \
+            -p "{\"spec\":{\"selector\":{\"app\":\"agri-fi-backend\",\"slot\":\"$SLOT\"}}}"
+
+          kubectl -n default run smoke-test-${GITHUB_SHA::12} \
+            --rm -i --restart=Never \
+            --image=curlimages/curl:latest \
+            --command -- sh -c '
+              set -e
+              curl -fsS --retry 10 --retry-delay 3 --retry-connrefused \
+                http://agri-fi-backend-smoke/health
+              curl -fsS http://agri-fi-backend-smoke/v1/trade-deals > /dev/null
+              curl -fsS http://agri-fi-backend-smoke/v1/prices/commodities > /dev/null
+              curl -fsS http://agri-fi-backend-smoke/v1/prices/fx > /dev/null
+            '
+
+          kubectl -n default delete svc agri-fi-backend-smoke --ignore-not-found=true
+
+      - name: Switch traffic to new slot
+        run: |
+          SLOT=${{ steps.bluegreen.outputs.inactive }}
+          kubectl -n default patch svc agri-fi-backend \
+            -p "{\"spec\":{\"selector\":{\"slot\":\"$SLOT\"}}}"
+          echo "Traffic switched to $SLOT"
+
+      - name: Keep old slot running for instant rollback (5 minutes)
+        run: |
+          echo "Old slot ${{ steps.bluegreen.outputs.active }} stays up for 5 minutes"
+          sleep 300
+
+      - name: Scale down old slot
+        run: |
+          kubectl -n default scale \
+            deployment/agri-fi-backend-${{ steps.bluegreen.outputs.active }} \
+            --replicas=0 || true
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          # Discord notification
+          if [ -n "${{ secrets.DISCORD_WEBHOOK_URL }}" ]; then
+            curl -X POST ${{ secrets.DISCORD_WEBHOOK_URL }} \
+              -H "Content-Type: application/json" \
+              -d '{
+                "content": "❌ **CD Deploy Job Failed**\n\n**Repository:** ${{ github.repository }}\n**Branch:** ${{ github.ref_name }}\n**Commit:** ${{ github.sha }}\n**Actor:** ${{ github.actor }}\n**Workflow:** ${{ github.workflow }}\n**Job:** deploy\n**Environment:** staging\n**Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                "username": "GitHub Actions"
+              }' || true
+          fi
+
+          # Slack notification
+          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
+              -H "Content-Type: application/json" \
+              -d '{
+                "text": "❌ CD Deploy Job Failed",
+                "blocks": [
+                  {
+                    "type": "header",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "❌ CD Deploy Job Failed"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "fields": [
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Repository:*\n${{ github.repository }}"
+                      },
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Branch:*\n${{ github.ref_name }}"
+                      },
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Commit:*\n${{ github.sha }}"
+                      },
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Actor:*\n${{ github.actor }}"
+                      },
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Job:*\ndeploy"
+                      },
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Environment:*\nstaging"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Workflow Run>"
+                    }
+                  }
+                ]
+              }' || true
+          fi
+
+  rollback:
+    name: Blue-green rollback
+    needs: [deploy]
+    if: needs.deploy.result == 'failure'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > "$HOME/.kube/config"
+
+      # #836 — instant rollback: re-point the service selector back to the
+      # previous active slot and remove the failed slot.
+      - name: Re-point service to previous active slot
+        run: |
+          PREVIOUS="${{ needs.deploy.outputs.active_slot }}"
+          FAILED="${{ needs.deploy.outputs.inactive_slot }}"
+
+          if [ -z "$PREVIOUS" ]; then
+            echo "No slot information captured; nothing to roll back."
+            exit 0
+          fi
+
+          echo "Rolling back: $FAILED -> $PREVIOUS"
+          kubectl -n default scale deployment/agri-fi-backend-$PREVIOUS --replicas=2
+          kubectl -n default patch svc agri-fi-backend \
+            -p "{\"spec\":{\"selector\":{\"slot\":\"$PREVIOUS\"}}}"
+          if [ -n "$FAILED" ]; then
+            kubectl -n default scale deployment/agri-fi-backend-$FAILED --replicas=0 || true
+          fi

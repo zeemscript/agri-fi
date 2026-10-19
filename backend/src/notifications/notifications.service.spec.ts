@@ -2,6 +2,8 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { NotificationsService } from './notifications.service';
 import { ConfigService } from '@nestjs/config';
 import { PinoLogger } from 'nestjs-pino';
+import { getRepositoryToken } from '@nestjs/typeorm';
+import { NotificationEntity } from './entities/notification.entity';
 import * as nodemailer from 'nodemailer';
 
 jest.mock('nodemailer');
@@ -45,6 +47,16 @@ describe('NotificationsService', () => {
           NotificationsService,
           { provide: ConfigService, useValue: configService },
           { provide: PinoLogger, useValue: logger },
+          {
+            provide: getRepositoryToken(NotificationEntity),
+            useValue: {
+              find: jest.fn(),
+              count: jest.fn(),
+              create: jest.fn(),
+              save: jest.fn(),
+              update: jest.fn(),
+            },
+          },
         ],
       }).compile();
 
@@ -66,8 +78,8 @@ describe('NotificationsService', () => {
         html: undefined,
       });
       expect(logger.info).toHaveBeenCalledWith(
-        expect.objectContaining({ to: 'user@test.com' }),
-        expect.any(String),
+        expect.objectContaining({ to: '***@test.com' }),
+        expect.stringContaining('***@test.com'),
       );
     });
 
@@ -79,7 +91,37 @@ describe('NotificationsService', () => {
         service.sendEmail('user@test.com', 'Subject', 'Text'),
       ).rejects.toThrow('SMTP Error');
 
-      expect(logger.error).toHaveBeenCalled();
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: '***@test.com',
+          error: 'SMTP Error',
+        }),
+        expect.stringContaining('***@test.com'),
+      );
+    });
+
+    it('should sanitise SMTP auth details in error logs', async () => {
+      const error = new Error(
+        'Invalid login: 535 5.7.8 Error: authentication failed: AUTH LOGIN abc123def456',
+      );
+      sendMailMock.mockRejectedValue(error);
+
+      await expect(
+        service.sendEmail('user@test.com', 'Subject', 'Text'),
+      ).rejects.toThrow();
+
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({
+          error: expect.stringContaining('AUTH ***'),
+        }),
+        expect.any(String),
+      );
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({
+          error: expect.not.stringContaining('abc123def456'),
+        }),
+        expect.any(String),
+      );
     });
   });
 
@@ -95,6 +137,16 @@ describe('NotificationsService', () => {
           NotificationsService,
           { provide: ConfigService, useValue: configService },
           { provide: PinoLogger, useValue: logger },
+          {
+            provide: getRepositoryToken(NotificationEntity),
+            useValue: {
+              find: jest.fn(),
+              count: jest.fn(),
+              create: jest.fn(),
+              save: jest.fn(),
+              update: jest.fn(),
+            },
+          },
         ],
       }).compile();
 
@@ -107,7 +159,7 @@ describe('NotificationsService', () => {
       expect(nodemailer.createTransport).not.toHaveBeenCalled();
       expect(sendMailMock).not.toHaveBeenCalled();
       expect(logger.info).toHaveBeenCalledWith(
-        expect.objectContaining({ to: 'user@test.com' }),
+        expect.objectContaining({ to: '***@test.com' }),
         expect.stringContaining('[Test Mode] Simulated sending email'),
       );
     });

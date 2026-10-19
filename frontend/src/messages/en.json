@@ -1,12 +1,163 @@
 {
+  "activityFeed": {
+    "title": "Activity Feed",
+    "empty": "No activity yet",
+    "emptyHint": "Events will appear here as the deal progresses",
+    "loadMore": "Load more",
+    "loading": "Loading…",
+    "loadError": "Failed to load activity feed",
+    "retry": "Try again",
+    "new": "new",
+    "dismissNew": "Dismiss new event count",
+    "events": {
+      "investor_joined": "A new investor joined",
+      "shipment_milestone": "Shipment milestone reached",
+      "funding_target_met": "Funding target met",
+      "payment_distributed": "Payment distribution triggered",
+      "document_uploaded": "Document uploaded by farmer",
+      "deal_status_changed": "Deal status changed"
+    }
+  },
   "nav": {
-    "title": "Agric-onchain Finance"
+    "title": "Agric-onchain Finance",
+    "dashboard": "Dashboard",
+    "marketplace": "Marketplace",
+    "documents": "Documents",
+    "settings": "Settings",
+    "kycStatus": "KYC Status",
+    "signOut": "Sign Out",
+    "menu": "Menu",
+    "roles": {
+      "farmer": "Farmer",
+      "trader": "Trader",
+      "investor": "Investor",
+      "company": "Company",
+      "admin": "Admin"
+    }
   },
   "home": {
     "title": "Agric-onchain Finance",
     "subtitle": "Blockchain-backed agricultural trade finance platform",
     "description": "Connect farmers, traders, and investors through tokenized agricultural trade deals on Stellar blockchain.",
     "viewMarketplace": "View Marketplace",
+    "getStarted": "Get Started",
+    "signIn": "Sign in",
+    "startFree": "Start for free",
+    "browseProjects": "Browse projects",
+    "trustedBy": "Trusted by {count} investors across Africa",
+    "liveOnStellar": "Live on Stellar Testnet · Zero fees during beta",
+    "hero": {
+      "titlePart1": "Agriculture meets",
+      "titlePart2": "DeFi",
+      "titlePart3": "— transparently."
+    },
+    "stats": {
+      "totalFunded": "Total Funded",
+      "activeProjects": "Active Projects",
+      "investors": "Investors",
+      "harvestSuccess": "Harvest Success"
+    },
+    "features": {
+      "badge": "Platform Features",
+      "title": "Everything in one ecosystem",
+      "description": "From seed funding to harvest sales — AgriFi handles the full agricultural value chain.",
+      "fundFarming": {
+        "title": "Fund Farming Projects",
+        "desc": "Farmers tokenize crops and raise capital. Investors get fractional ownership with transparent on-chain returns."
+      },
+      "realTime": {
+        "title": "Real-Time Tracking",
+        "desc": "Live harvest updates, GPS shipment milestones, and immutable proof of every transaction on Stellar."
+      },
+      "marketplace": {
+        "title": "Direct Marketplace",
+        "desc": "Companies buy verified agricultural products straight from farmers — zero middlemen, full traceability."
+      },
+      "escrow": {
+        "title": "Stellar Escrow",
+        "desc": "Smart escrow accounts, tokenized assets, and cryptographic proof secure every deal end-to-end."
+      }
+    },
+    "roles": {
+      "farmer": {
+        "title": "Farmers",
+        "cta": "Start as Farmer",
+        "points": ["Launch funding campaigns", "Upload farm & harvest data", "Sell directly to buyers", "Withdraw earnings instantly"]
+      },
+      "investor": {
+        "title": "Investors",
+        "cta": "Start Investing",
+        "points": ["Browse vetted projects", "Invest fractionally from $100", "Earn transparent ROI", "Track portfolio in real-time"]
+      },
+      "company": {
+        "title": "Companies",
+        "cta": "Register as Buyer",
+        "points": ["Buy bulk produce direct", "Verified farmer network", "Track deliveries live", "Secure escrow payments"]
+      }
+    },
+    "steps": {
+      "title": "How it works",
+      "step1": { "title": "Create Account", "desc": "Sign up as a farmer, investor, or company in under 2 minutes." },
+      "step2": { "title": "Complete KYC", "desc": "Verify your identity to unlock full platform access." },
+      "step3": { "title": "Fund or List", "desc": "Farmers list crops; investors browse and fund projects." },
+      "step4": { "title": "Earn Returns", "desc": "Track harvest, receive payouts, and reinvest profits." }
+    },
+    "transparency": {
+      "badge": "Stellar Blockchain",
+      "title": "Transparent by design",
+      "description": "Every investment, payout, and milestone is recorded on Stellar. Verify anything, anytime.",
+      "smartContracts": { "title": "Soroban Smart Contracts", "desc": "FarmCampaign contracts automate escrow, milestone releases, and revenue distribution." },
+      "tokenized": { "title": "Tokenized Investments", "desc": "Each project issues Stellar assets. Investors hold tokens representing fractional ownership, tradeable on the DEX." },
+      "usdc": { "title": "USDC Settlements", "desc": "All payments use USDC on Stellar — stable, fast, and cross-border." },
+      "certificates": { "title": "On-Chain Certificates", "desc": "Investment certificates are backed by immutable Stellar transactions." },
+      "anchors": { "title": "Stellar Anchors", "desc": "Deposit NGN, KES, GHS, ZAR or USD and receive USDC instantly." },
+      "audit": { "title": "Public Audit Trail", "desc": "Every contract address, transaction hash, and payout is publicly verifiable on Stellar Expert." },
+      "viewData": "View Live Blockchain Data"
+    },
+    "cta": {
+      "title": "Ready to grow your wealth?",
+      "description": "Join thousands of farmers, investors, and buyers already building the future of agriculture.",
+      "createAccount": "Create Free Account",
+      "browseMarketplace": "Browse Marketplace"
+    },
+    "footer": {
+      "rights": "© {year} AgriFi. All rights reserved.",
+      "poweredBy": "Powered by {brand} blockchain"
+    },
+    "dashboard": {
+      "farmer": {
+        "title": "Farmer Dashboard",
+        "greeting": "Good day 👋",
+        "listCrop": "List Crop",
+        "stats": {
+          "totalProjects": "Total Projects",
+          "active": "Active",
+          "totalValue": "Total Value",
+          "funded": "Funded"
+        },
+        "kyc": {
+          "title": "KYC verification required",
+          "desc": "Complete KYC to publish deals and receive payments.",
+          "verifyNow": "Verify now →"
+        },
+        "noProjects": {
+          "title": "No projects yet",
+          "desc": "List your first crop to start raising funding from investors worldwide.",
+          "cta": "+ List Your First Crop"
+        },
+        "projects": {
+          "title": "Your Projects",
+          "total": "{count} total",
+          "fundingProgress": "Funding progress",
+          "viewDetails": "View Details →"
+        },
+        "modal": {
+          "title": "List Your Crop",
+          "subtitle": "Create a new funding campaign",
+          "success": "Crop listed successfully! 🌱"
+        }
+      }
+    },
     "instructions": {
       "title": "Make sure to:",
       "installWallet": "Install Freighter wallet extension",
@@ -14,9 +165,319 @@
       "connectWallet": "Connect your wallet in the top navigation"
     }
   },
+  "wallet": {
+    "title": "Connect Stellar Wallet",
+    "subtitle": "Choose a wallet provider to connect",
+    "description": "Your private key never leaves your wallet. Agri-Fi only ever sees your public key.",
+    "connectButton": "Connect Wallet",
+    "connecting": "Connecting…",
+    "connected": "Connected",
+    "disconnect": "Disconnect",
+    "freighter": {
+      "name": "Freighter",
+      "type": "Browser extension wallet"
+    },
+    "albedo": {
+      "name": "Albedo",
+      "type": "Web-based signer — no install needed"
+    },
+    "walletConnect": {
+      "name": "WalletConnect",
+      "type": "Connect via QR code or deep link"
+    },
+    "detected": "Detected",
+    "install": "Install",
+    "alwaysAvailable": "Always available",
+    "openDialog": "Open wallet connection dialog",
+    "closeDialog": "Close wallet connection dialog",
+    "error": "Error connecting wallet",
+    "errorConnect": "Failed to connect wallet",
+    "errorLink": "Failed to link wallet",
+    "pleaseTryAgain": "Please try again",
+    "onboarding": {
+      "title": "Connect your wallet",
+      "subtitle": "Choose a Stellar wallet to get started",
+      "comingSoon": "Coming soon",
+      "termsNote": "By connecting, you agree to our Terms of Service. Your keys stay in your wallet.",
+      "networkMismatch": "Network mismatch: your wallet is on {detected} but this app requires {expected}. Please switch networks in your wallet.",
+      "freighterGuide": {
+        "title": "How to install Freighter",
+        "step1": "Visit freighter.app and click Install",
+        "step2": "Add the extension to your browser",
+        "step3": "Create or import a Stellar account",
+        "cta": "Install Freighter →"
+      }
+    }
+  },
+  "investment": {
+    "title": "Invest",
+    "subtitle": "Select token quantity to invest",
+    "tokenQuantity": "Token Quantity",
+    "tokenPrice": "Token Price",
+    "totalAmount": "Total Amount",
+    "maxTokens": "Max: {max} tokens",
+    "insufficientTokens": "Not enough tokens available",
+    "invest": "Invest",
+    "investing": "Investing...",
+    "invalidQuantity": "Token quantity must be between 1 and {max}",
+    "connectWallet": "Please connect your wallet first",
+    "success": "Investment successful!",
+    "error": "Investment failed",
+    "txPending": "Transaction pending...",
+    "txConfirmed": "Transaction confirmed",
+    "txFailed": "Transaction failed"
+  },
+  "deals": {
+    "coFarmers": {
+      "title": "Co-farmers",
+      "description": "Invite other farmers onto this deal — each co-farmer is responsible for their portion of the delivery and receives that share of the payout.",
+      "emailLabel": "Co-farmer email",
+      "portionLabel": "Portion (%)",
+      "add": "Add co-farmer",
+      "remove": "Remove",
+      "invalidEmail": "Enter a valid email address.",
+      "invalidPortion": "Portion must be between 0 and 100.",
+      "totalTooHigh": "Total portions cannot exceed 100%.",
+      "inviteFailed": "The deal was created, but some invitations could not be sent."
+    },
+    "createTitle": "Create New Trade Deal",
+    "draftRestored": "Restored draft from {time}",
+    "wizardBadge": "Deal listing wizard",
+    "createSubtitle": "Build a complete, investor-ready listing with guided steps, smart validation, and draft autosave.",
+    "saving": "Saving draft...",
+    "saved": "Draft saved",
+    "stepLabel": "Step {current} of {total}",
+    "commodity": "Commodity Name",
+    "quantity": "Quantity",
+    "unit": "Unit",
+    "totalValue": "Total Value (USD)",
+    "tokenPrice": "Token Price (USD)",
+    "deliveryDate": "Delivery Date (End Date)",
+    "farmerId": "Farmer ID (Optional)",
+    "traderId": "Trader ID (Optional)",
+    "createButton": "Create Deal",
+    "creating": "Creating...",
+    "cancel": "Cancel",
+    "back": "Back",
+    "next": "Next",
+    "submitForReview": "Submit for review",
+    "submitSuccess": "Deal submitted for admin review.",
+    "roiWarningHigh": "This ROI is unusually high. Please double-check your assumptions before submitting.",
+    "roiWarningNormal": "ROI looks within a normal range.",
+    "photoHelper": "Upload 1 to 10 photos. Each image must be at least 500px wide.",
+    "docHelper": "Upload the required documents for your commodity category before you submit.",
+    "tokenInfo": "This will create {count} tokens at ${price} each.",
+    "raised": "{amount} raised",
+    "remainingOf": "{remaining} remaining of {total}",
+    "status": "Status",
+    "details": "Details",
+    "documents": "Documents",
+    "milestones": "Milestones",
+    "investors": "Investors",
+    "fundingProgress": "Funding Progress",
+    "publishDeal": "Publish Deal",
+    "validation": {
+      "commodityRequired": "Commodity name is required",
+      "quantityMin": "Quantity must be at least 1",
+      "totalValueMin": "Total value must be greater than 1000",
+      "tokenPriceFixed": "Token price must be exactly 100",
+      "deliveryDateRequired": "Delivery date is required",
+      "deliveryDateFuture": "End date must be in the future",
+      "invalidId": "Invalid ID",
+      "titleRequired": "Title is required",
+      "countryRequired": "Country is required",
+      "shortDescriptionRequired": "Short description is required",
+      "duplicateTitle": "A deal with this title already exists.",
+      "minInvestmentLot": "Minimum investment lot must be greater than 0",
+      "expectedRoiMin": "Expected ROI must be greater than 0",
+      "durationRequired": "Duration is required",
+      "riskRequired": "Risk rating is required",
+      "longDescriptionRequired": "Story and impact are required",
+      "farmLocationRequired": "Farm location is required",
+      "photoMin": "Please upload at least one farm photo.",
+      "photoMax": "You can upload a maximum of 10 photos.",
+      "photoWidth": "Photos must be at least 500px wide.",
+      "mapRequired": "Please add latitude and longitude for the farm location.",
+      "documentRequired": "{name} is required for this commodity.",
+      "logisticsRequired": "Please complete all logistics milestones.",
+      "submitFailed": "Failed to submit the deal."
+    }
+  },
+  "marketplace": {
+    "title": "Marketplace",
+    "subtitle": "Explore agricultural trade deals",
+    "searchPlaceholder": "Search commodity, trader...",
+    "filterByStatus": "Filter by Status",
+    "filterByCategory": "Filter by Category",
+    "sortBy": "Sort By",
+    "noDeals": "No deals available",
+    "loadingDeals": "Loading deals...",
+    "status": {
+      "draft": "Draft",
+      "published": "Published",
+      "funded": "Funded",
+      "completed": "Completed",
+      "cancelled": "Cancelled"
+    }
+  },
   "common": {
     "loading": "Loading...",
     "error": "Error",
-    "success": "Success"
+    "success": "Success",
+    "processing": "Processing...",
+    "dismiss": "Dismiss",
+    "validation": {
+      "emailRequired": "Email is required.",
+      "emailInvalid": "Enter a valid email address.",
+      "credentialsInvalid": "Email or password is incorrect.",
+      "emailTaken": "An account with this email already exists.",
+      "passwordRequired": "Password is required.",
+      "passwordMin": "Password must be at least 8 characters.",
+      "nameRequired": "Full name is required.",
+      "countryRequired": "Country is required.",
+      "quantityMin": "Enter at least {min} tokens.",
+      "quantityMax": "Enter no more than {max} tokens.",
+      "currentPasswordRequired": "Current password is required.",
+      "currentPasswordIncorrect": "Current password is incorrect.",
+      "newPasswordRequired": "New password is required.",
+      "passwordMustDiffer": "New password must differ from the current password.",
+      "confirmPasswordRequired": "Confirm your new password.",
+      "passwordMismatch": "Passwords do not match.",
+      "mfaCodeRequired": "Authenticator code is required.",
+      "mfaCodeInvalid": "Enter the 6-digit authenticator code.",
+      "passwordChangeFailed": "Unable to change password. Please try again.",
+      "mfaSetupFailed": "Unable to start MFA setup. Please try again.",
+      "mfaEnableFailed": "Unable to enable MFA. Please try again.",
+      "mfaDisableFailed": "Unable to disable MFA. Please try again."
+    },
+    "network": {
+      "offline": {
+        "title": "You are offline.",
+        "description": "Actions requiring internet access are disabled until connection is restored."
+      }
+    }
+  },
+  "referrals": {
+    "title": "Referral Program",
+    "description": "Share your referral link and earn rewards when referred users make their first investment.",
+    "yourLink": "Your Referral Link",
+    "copy": "Copy",
+    "copied": "Copied!",
+    "whatsapp": "WhatsApp",
+    "twitter": "Twitter",
+    "referredUsers": "Referred Users",
+    "noReferrals": "No referrals yet",
+    "shareToStart": "Share your link to start earning rewards!",
+    "linkClicks": "Link Clicks",
+    "registered": "Registered",
+    "rewarded": "Rewarded",
+    "totalEarned": "Total Earned",
+    "user": "User",
+    "status": "Status",
+    "reward": "Reward",
+    "date": "Date"
+  },
+  "farmerProfile": {
+    "nav": {
+      "marketplace": "Marketplace"
+    },
+    "hero": {
+      "title": "Farmer from {country}",
+      "avatarAlt": "Farmer avatar from {country}",
+      "memberSince": "Member since {date}"
+    },
+    "verification": {
+      "heading": "Verification & Badges",
+      "kycLabel": "KYC status: {status}",
+      "walletConnected": "Wallet connected",
+      "dealsCount": "{count, plural, one {# deal completed} other {# deals completed}}",
+      "kyc": {
+        "verified": "KYC Verified",
+        "pending": "KYC Pending",
+        "rejected": "KYC Rejected",
+        "expired": "KYC Expired"
+      }
+    },
+    "reputation": {
+      "heading": "Reputation Score",
+      "gaugeAriaLabel": "Reputation score: {score} out of 100",
+      "tooltip": "Based on deal history & repayment",
+      "excellent": "Excellent",
+      "good": "Good",
+      "fair": "Fair",
+      "poor": "Needs improvement",
+      "creditScore": "Credit Score",
+      "onTimeRate": "On-time repayment",
+      "creditTier": {}
+    },
+    "creditTier": {
+      "excellent": "Excellent",
+      "good": "Good",
+      "fair": "Fair"
+    },
+    "activeDeals": {
+      "heading": "Active Deals",
+      "none": "No active deals at the moment.",
+      "activeDeal": "Active Deal",
+      "statusActive": "Active",
+      "viewOnMarketplace": "View on marketplace",
+      "browseLink": "Browse marketplace",
+      "cardAriaLabel": "Active deal #{number}"
+    },
+    "completedDeals": {
+      "heading": "Completed Deals",
+      "tableCaption": "List of completed trade deals",
+      "colDeal": "Deal",
+      "colStatus": "Status",
+      "colRepayment": "Repayment rate",
+      "none": "No completed deals yet.",
+      "dealLabel": "Deal #{number}",
+      "statusCompleted": "Completed"
+    },
+    "stats": {
+      "heading": "Summary",
+      "dealsCompleted": "Deals completed",
+      "activeDeals": "Active deals",
+      "memberSince": "Member since",
+      "country": "Country"
+    }
+  },
+  "format": {
+    "currency": "{value, number, currency}",
+    "date": "{value, date, short}",
+    "number": "{value, number}"
+  },
+  "tour": {
+    "welcome": {
+      "title": "Welcome to Agri-Fi",
+      "text": "This quick tour will walk you through the key features of the platform. You can restart this tour anytime from Settings."
+    },
+    "browseDeals": {
+      "title": "Browse Deals",
+      "text": "Find investment opportunities in agricultural trade deals. Filter by commodity, status, and more."
+    },
+    "connectWallet": {
+      "title": "Connect Your Wallet",
+      "text": "Connect your Stellar wallet to invest in deals and track your portfolio on-chain."
+    },
+    "portfolioStats": {
+      "title": "Portfolio Stats",
+      "text": "Track your investments, returns, and deal performance at a glance."
+    },
+    "notificationBell": {
+      "title": "Stay Updated",
+      "text": "Get real-time notifications about your deals, investments, and platform updates."
+    },
+    "complete": {
+      "title": "You're All Set!",
+      "text": "You're ready to start exploring Agri-Fi. Happy investing!"
+    },
+    "buttons": {
+      "next": "Next",
+      "back": "Back",
+      "skip": "Skip Tour",
+      "finish": "Get Started"
+    },
+    "restart": "Restart Tour"
   }
 }

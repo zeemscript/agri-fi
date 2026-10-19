@@ -4,8 +4,8 @@ import { DataSource, Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { EscrowService } from './escrow.service';
 import { PaymentDistribution } from './entities/payment-distribution.entity';
-import { TradeDeal } from '../users/entities/trade-deal.entity';
-import { Investment } from '../users/entities/investment.entity';
+import { TradeDeal } from '../trade-deals/entities/trade-deal.entity';
+import { Investment } from '../investments/entities/investment.entity';
 import { User } from '../auth/entities/user.entity';
 import { StellarService } from '../stellar/stellar.service';
 import { QueueService } from '../queue/queue.service';
@@ -23,6 +23,8 @@ describe('EscrowService', () => {
   let mockDataSource: jest.Mocked<DataSource>;
 
   beforeEach(async () => {
+    jest.useFakeTimers();
+
     const mockManager = {
       findOne: jest.fn(),
       find: jest.fn(),
@@ -49,10 +51,12 @@ describe('EscrowService', () => {
 
     mockStellarService = {
       releaseEscrow: jest.fn(),
+      decryptSecret: jest.fn(),
     } as any;
 
     mockQueueService = {
       emit: jest.fn(),
+      enqueueDealCleanup: jest.fn().mockResolvedValue(undefined),
     } as any;
 
     mockConfigService = {
@@ -109,6 +113,10 @@ describe('EscrowService', () => {
     service = module.get<EscrowService>(EscrowService);
   });
 
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
   describe('processDealDelivered', () => {
     it('should successfully process escrow release and complete deal', async () => {
       const tradeDealId = 'deal-123';
@@ -156,13 +164,21 @@ describe('EscrowService', () => {
         (cb: (m: typeof mockManager) => Promise<unknown>) => cb(mockManager),
       );
       mockConfigService.get.mockReturnValue('platform-wallet');
+      mockStellarService.decryptSecret.mockReturnValue(
+        'decrypted-escrow-secret',
+      );
       mockStellarService.releaseEscrow.mockResolvedValue(['stellar-tx-123']);
 
       await service.processDealDelivered(payload);
 
-      // Verify Stellar escrow release was called
-      expect(mockStellarService.releaseEscrow).toHaveBeenCalledWith(
+      // Verify Stellar secret was decrypted
+      expect(mockStellarService.decryptSecret).toHaveBeenCalledWith(
         'escrow-secret',
+      );
+
+      // Verify Stellar escrow release was called with decrypted secret
+      expect(mockStellarService.releaseEscrow).toHaveBeenCalledWith(
+        'decrypted-escrow-secret',
         'farmer-wallet',
         [
           {

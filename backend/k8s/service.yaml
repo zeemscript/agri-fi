@@ -1,0 +1,19 @@
+# Backend service (#836). Traffic is routed to the active blue-green slot via
+# the `slot` selector; the CD pipeline flips this selector to switch slots and
+# flips it back for instant rollback.
+apiVersion: v1
+kind: Service
+metadata:
+  name: agri-fi-backend
+  labels:
+    app: agri-fi-backend
+spec:
+  type: ClusterIP
+  selector:
+    app: agri-fi-backend
+    slot: blue
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

@@ -1,0 +1,908 @@
+'use client';
+
+import { useEffect, useState, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
+import { apiClient, User, getStoredToken } from '@/lib/api';
+import DashboardLayout from '@/components/DashboardLayout';
+import StatCard from '@/components/StatCard';
+import { useToast } from '@/components/ui/ToastProvider';
+
+interface AdminUser {
+  id: string; email: string; role: string; kycStatus: string;
+  country: string; createdAt: string; walletAddress?: string | null;
+}
+
+/** Shape returned by GET /admin/payments/failed */
+interface FailedPayment {
+  id: string;
+  dealId: string | null;
+  userId: string | null;
+  txHash: string | null;
+  errorCode: string | null;
+  createdAt: string;
+  dealCommodity: string | null;
+}
+
+interface PaginatedFailedPayments {
+  data: FailedPayment[];
+  meta: { total: number; page: number; limit: number; totalPages: number };
+}
+
+const ROLE_BADGE: Record<string, string> = {
+  farmer: 'badge-green', investor: 'badge-purple', trader: 'badge-blue',
+  admin: 'badge-gray', company_admin: 'badge-orange',
+};
+const KYC_BADGE: Record<string, string> = {
+  verified: 'badge-green', pending: 'badge-yellow', rejected: 'badge-red',
+};
+
+export default function AdminDashboard() {
+  const router = useRouter();
+  const { toast } = useToast();
+  const [user, setUser] = useState<User | null>(null);
+  const [users, setUsers] = useState<AdminUser[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState<'overview' | 'users' | 'kyc' | 'blockchain' | 'payments'>('overview');
+  const [search, setSearch] = useState('');
+  const [actionId, setActionId] = useState<string | null>(null);
+
+  // ── Failed Payments State ─────────────────────────────────────────────────
+  const [failedPayments, setFailedPayments] = useState<FailedPayment[]>([]);
+  const [failedPaymentsMeta, setFailedPaymentsMeta] = useState<PaginatedFailedPayments['meta'] | null>(null);
+  const [failedPaymentsLoading, setFailedPaymentsLoading] = useState(false);
+  const [failedPaymentsPage, setFailedPaymentsPage] = useState(1);
+  const [retryingId, setRetryingId] = useState<string | null>(null);
+
+  // ── Bulk KYC State (#800) ─────────────────────────────────────────────────
+  const [selectedKycIds, setSelectedKycIds] = useState<Set<string>>(new Set());
+  const [bulkActionLoading, setBulkActionLoading] = useState(false);
+  const [showRejectModal, setShowRejectModal] = useState(false);
+  const [bulkRejectionReason, setBulkRejectionReason] = useState('');
+
+  useEffect(() => {
+    (async () => {
+      const cached = apiClient.getCurrentUser();
+      if (!cached) { router.push('/login'); return; }
+      let u = cached;
+      try { const f = await apiClient.refreshCurrentUser(); if (f) u = f; } catch {}
+      if (u.role !== 'admin') { router.push(`/dashboard/${u.role}`); return; }
+      setUser(u);
+      loadUsers();
+    })();
+  }, [router]);
+
+  const loadUsers = async () => {
+    setLoading(true);
+    try {
+      const token = getStoredToken();
+      const res = await fetch('/api/admin/users', { headers: { Authorization: `Bearer ${token}` } });
+      if (res.ok) { const d = await res.json(); setUsers(d.users ?? d ?? []); }
+    } catch {}
+    setLoading(false);
+  };
+
+  const loadFailedPayments = useCallback(async (page = 1) => {
+    setFailedPaymentsLoading(true);
+    try {
+      const token = getStoredToken();
+      const res = await fetch(`/api/admin/payments/failed?page=${page}&limit=20`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const d: PaginatedFailedPayments = await res.json();
+        setFailedPayments(d.data ?? []);
+        setFailedPaymentsMeta(d.meta ?? null);
+        setFailedPaymentsPage(page);
+      } else {
+        toast('Failed to load payment alerts', 'error');
+      }
+    } catch {
+      toast('Could not fetch payment data', 'error');
+    }
+    setFailedPaymentsLoading(false);
+  }, [toast]);
+
+  // Load failed payments when the payments tab is first selected
+  useEffect(() => {
+    if (tab === 'payments' && failedPayments.length === 0 && !failedPaymentsLoading) {
+      loadFailedPayments(1);
+    }
+  }, [tab, failedPayments.length, failedPaymentsLoading, loadFailedPayments]);
+
+  const retryPayment = async (txId: string) => {
+    setRetryingId(txId);
+    try {
+      const token = getStoredToken();
+      const res = await fetch(`/api/admin/payments/failed/${txId}/retry`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        toast('Retry enqueued successfully ✅', 'success');
+        // Refresh the list after a short delay so the user sees updated state
+        setTimeout(() => loadFailedPayments(failedPaymentsPage), 1000);
+      } else {
+        const d = await res.json();
+        toast(d.message ?? 'Retry failed', 'error');
+      }
+    } catch {
+      toast('Request failed', 'error');
+    }
+    setRetryingId(null);
+  };
+
+  const approveKyc = async (userId: string) => {
+    setActionId(userId);
+    try {
+      const token = getStoredToken();
+      const res = await fetch(`/api/admin/kyc/${userId}/approve`, {
+        method: 'POST', headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) { toast('KYC approved! ✅', 'success'); loadUsers(); }
+      else { const d = await res.json(); toast(d.message ?? 'Failed', 'error'); }
+    } catch { toast('Request failed', 'error'); }
+    setActionId(null);
+  };
+
+  const toggleKycSelection = (userId: string) => {
+    setSelectedKycIds(prev => {
+      const next = new Set(prev);
+      if (next.has(userId)) next.delete(userId);
+      else next.add(userId);
+      return next;
+    });
+  };
+
+  const selectAllKyc = (ids: string[]) => {
+    setSelectedKycIds(new Set(ids));
+  };
+
+  const clearKycSelection = () => {
+    setSelectedKycIds(new Set());
+  };
+
+  const bulkKycAction = async (action: 'approve' | 'reject', reason?: string) => {
+    if (selectedKycIds.size === 0) return;
+    if (action === 'reject' && !reason?.trim()) {
+      toast('A reason is required for rejection', 'error');
+      return;
+    }
+    setBulkActionLoading(true);
+    try {
+      const token = getStoredToken();
+      const res = await fetch('/api/admin/kyc/bulk', {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userIds: Array.from(selectedKycIds),
+          action,
+          ...(reason ? { reason } : {}),
+        }),
+      });
+      const d = await res.json();
+      if (res.ok) {
+        const { processed = [], failures = [] } = d;
+        if (failures.length === 0) {
+          toast(`${processed.length} KYC submission${processed.length !== 1 ? 's' : ''} ${action}d ✅`, 'success');
+        } else {
+          toast(`${processed.length} succeeded, ${failures.length} failed`, 'error');
+        }
+        clearKycSelection();
+        setBulkRejectionReason('');
+        setShowRejectModal(false);
+        loadUsers();
+      } else {
+        toast(d.message ?? 'Bulk action failed', 'error');
+      }
+    } catch { toast('Request failed', 'error'); }
+    setBulkActionLoading(false);
+  };
+
+  const updateRole = async (userId: string, role: string) => {
+    setActionId(userId);
+    try {
+      const token = getStoredToken();
+      const res = await fetch(`/api/admin/users/${userId}/role`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role }),
+      });
+      if (res.ok) { toast('Role updated!', 'success'); loadUsers(); }
+      else { const d = await res.json(); toast(d.message ?? 'Failed', 'error'); }
+    } catch { toast('Request failed', 'error'); }
+    setActionId(null);
+  };
+
+  const pendingKyc = users.filter(u => u.kycStatus === 'pending');
+  const verified   = users.filter(u => u.kycStatus === 'verified').length;
+  const byRole     = (r: string) => users.filter(u => u.role === r).length;
+
+  const filtered = users.filter(u =>
+    !search || u.email.toLowerCase().includes(search.toLowerCase()) || u.role.includes(search.toLowerCase())
+  );
+
+  if (!user) return null;
+
+  return (
+    <DashboardLayout user={user}>
+      <div className="page-content">
+        <div>
+          <p className="text-sm text-slate-500 mb-1">Platform management</p>
+          <h1 className="page-title">Admin Dashboard</h1>
+        </div>
+
+        {/* Stats */}
+        <div data-tour="portfolio-stats" className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3 md:gap-4">
+          <StatCard label="Total Users"  value={users.length}    icon="👥" color="bg-blue-50" />
+          <StatCard label="Farmers"      value={byRole('farmer')} icon="🌱" color="bg-emerald-50" />
+          <StatCard label="Investors"    value={byRole('investor')} icon="💼" color="bg-violet-50" />
+          <StatCard label="KYC Verified" value={verified}         icon="✅" color="bg-amber-50"
+            trend={`${pendingKyc.length} pending`} trendUp={pendingKyc.length === 0} />
+        </div>
+
+        {/* Tabs */}
+        <div className="flex gap-1 bg-slate-100 rounded-xl p-1 w-fit">
+          {(['overview', 'users', 'kyc', 'blockchain', 'payments'] as const).map(t => (
+            <button key={t} onClick={() => setTab(t)}
+              className={`px-4 py-2 rounded-lg text-sm font-semibold capitalize transition-all ${
+                tab === t ? 'bg-white shadow-sm text-slate-900' : 'text-slate-500 hover:text-slate-700'
+              }`}>
+              {t === 'blockchain' ? '⛓ Blockchain' : t === 'payments' ? '⚠️ Payments' : t}
+              {t === 'kyc' && pendingKyc.length > 0 && (
+                <span className="ml-1.5 bg-red-500 text-white text-[10px] rounded-full px-1.5 py-0.5 font-bold">
+                  {pendingKyc.length}
+                </span>
+              )}
+              {t === 'payments' && (failedPaymentsMeta?.total ?? 0) > 0 && (
+                <span className="ml-1.5 bg-red-500 text-white text-[10px] rounded-full px-1.5 py-0.5 font-bold">
+                  {failedPaymentsMeta!.total}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+
+        {/* Overview */}
+        {tab === 'overview' && (
+          <div className="grid sm:grid-cols-2 md:grid-cols-2 gap-5">
+            <div className="card p-5">
+              <h3 className="section-title mb-5">Users by Role</h3>
+              <div className="space-y-3">
+                {['farmer','investor','trader','company_admin','admin'].map(r => {
+                  const count = byRole(r);
+                  const pct = users.length ? (count / users.length) * 100 : 0;
+                  return (
+                    <div key={r} className="flex items-center gap-3">
+                      <span className={`${ROLE_BADGE[r] ?? 'badge-gray'} w-24 justify-center`}>{r}</span>
+                      <div className="flex-1 progress-track">
+                        <div className="progress-green" style={{ width: `${pct}%` }} />
+                      </div>
+                      <span className="text-sm font-bold text-slate-900 w-5 text-right">{count}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="card p-5">
+              <h3 className="section-title mb-5">KYC Status</h3>
+              <div className="space-y-3">
+                {[['verified','badge-green'],['pending','badge-yellow'],['rejected','badge-red']].map(([s, cls]) => {
+                  const count = users.filter(u => u.kycStatus === s).length;
+                  const pct = users.length ? (count / users.length) * 100 : 0;
+                  return (
+                    <div key={s} className="flex items-center gap-3">
+                      <span className={`${cls} w-20 justify-center`}>{s}</span>
+                      <div className="flex-1 progress-track">
+                        <div className={s === 'verified' ? 'progress-green' : s === 'pending' ? 'h-full bg-amber-400 rounded-full' : 'h-full bg-red-400 rounded-full'}
+                          style={{ width: `${pct}%` }} />
+                      </div>
+                      <span className="text-sm font-bold text-slate-900 w-5 text-right">{count}</span>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {pendingKyc.length > 0 && (
+                <button onClick={() => setTab('kyc')}
+                  className="btn-primary w-full mt-5 text-sm">
+                  Review {pendingKyc.length} pending KYC →
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Users table */}
+        {tab === 'users' && (
+          <div className="space-y-4">
+            <div className="flex gap-3">
+              <div className="relative flex-1 max-w-sm">
+                <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+                  </svg>
+                </span>
+                <input className="input pl-10" placeholder="Search by email or role…"
+                  value={search} onChange={e => setSearch(e.target.value)} />
+              </div>
+              <span className="flex items-center text-sm text-slate-500">{filtered.length} users</span>
+            </div>
+
+            {loading ? (
+              <div className="card h-40 skeleton" />
+            ) : (
+              <div className="table-wrapper">
+                <div className="overflow-x-auto">
+                  <table className="w-full">
+                    <thead className="table-head">
+                      <tr>
+                        {['Email','Role','KYC','Country','Joined','Change Role'].map(h => (
+                          <th key={h} className="table-th">{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filtered.map(u => (
+                        <tr key={u.id} className="table-row">
+                          <td className="table-td font-medium text-slate-900">{u.email}</td>
+                          <td className="table-td"><span className={ROLE_BADGE[u.role] ?? 'badge-gray'}>{u.role}</span></td>
+                          <td className="table-td"><span className={KYC_BADGE[u.kycStatus] ?? 'badge-gray'}>{u.kycStatus}</span></td>
+                          <td className="table-td text-slate-500">{u.country}</td>
+                          <td className="table-td text-slate-400">{new Date(u.createdAt).toLocaleDateString()}</td>
+                          <td className="table-td">
+                            <select
+                              disabled={actionId === u.id}
+                              defaultValue={u.role}
+                              onChange={e => updateRole(u.id, e.target.value)}
+                              className="text-xs border border-slate-200 rounded-lg px-2.5 py-1.5 bg-white focus:outline-none focus:ring-2 focus:ring-brand-500 disabled:opacity-50">
+                              {['farmer','trader','investor','company_admin','admin'].map(r => (
+                                <option key={r} value={r}>{r}</option>
+                              ))}
+                            </select>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {filtered.length === 0 && (
+                    <div className="text-center py-12 text-slate-400">No users found</div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* KYC review */}
+        {tab === 'kyc' && (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <h2 className="section-title">Pending KYC Reviews</h2>
+              <div className="flex items-center gap-2">
+                {selectedKycIds.size > 0 && (
+                  <span className="text-sm text-slate-500">{selectedKycIds.size} selected</span>
+                )}
+                <span className="muted">{pendingKyc.length} pending</span>
+              </div>
+            </div>
+
+            {pendingKyc.length > 0 && (
+              <div className="flex flex-wrap gap-2 items-center bg-slate-50 border border-slate-200 rounded-xl p-3">
+                {/* Select all / clear */}
+                <button
+                  onClick={() =>
+                    selectedKycIds.size === pendingKyc.length
+                      ? clearKycSelection()
+                      : selectAllKyc(pendingKyc.map(u => u.id))
+                  }
+                  className="text-xs px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 font-medium text-slate-700">
+                  {selectedKycIds.size === pendingKyc.length ? 'Deselect all' : 'Select all'}
+                </button>
+
+                {/* Bulk approve */}
+                <button
+                  disabled={selectedKycIds.size === 0 || bulkActionLoading}
+                  onClick={() => bulkKycAction('approve')}
+                  className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-emerald-600 text-white font-semibold disabled:opacity-40 hover:bg-emerald-700 transition-colors">
+                  {bulkActionLoading ? (
+                    <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                    </svg>
+                  ) : '✓'}
+                  Approve selected ({selectedKycIds.size})
+                </button>
+
+                {/* Bulk reject */}
+                <button
+                  disabled={selectedKycIds.size === 0 || bulkActionLoading}
+                  onClick={() => setShowRejectModal(true)}
+                  className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-red-600 text-white font-semibold disabled:opacity-40 hover:bg-red-700 transition-colors">
+                  ✕ Reject selected ({selectedKycIds.size})
+                </button>
+              </div>
+            )}
+
+            {/* Reject reason modal */}
+            {showRejectModal && (
+              <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+                <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6 space-y-4">
+                  <h3 className="text-lg font-bold text-slate-900">Reject {selectedKycIds.size} KYC submission{selectedKycIds.size !== 1 ? 's' : ''}</h3>
+                  <p className="text-sm text-slate-500">Please provide a mandatory reason for rejection. This will be recorded in the audit log and sent to affected users.</p>
+                  <textarea
+                    className="w-full border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-red-500 resize-none"
+                    rows={3}
+                    placeholder="e.g. Documents expired, name mismatch, address verification failed…"
+                    value={bulkRejectionReason}
+                    onChange={e => setBulkRejectionReason(e.target.value)}
+                  />
+                  <div className="flex gap-2 justify-end">
+                    <button
+                      onClick={() => { setShowRejectModal(false); setBulkRejectionReason(''); }}
+                      className="px-4 py-2 rounded-lg border border-slate-200 text-sm font-medium text-slate-700 hover:bg-slate-50">
+                      Cancel
+                    </button>
+                    <button
+                      disabled={!bulkRejectionReason.trim() || bulkRejectionReason.trim().length < 3 || bulkActionLoading}
+                      onClick={() => bulkKycAction('reject', bulkRejectionReason)}
+                      className="px-4 py-2 rounded-lg bg-red-600 text-white text-sm font-semibold disabled:opacity-40 hover:bg-red-700 flex items-center gap-2">
+                      {bulkActionLoading && (
+                        <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                        </svg>
+                      )}
+                      Confirm Rejection
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {pendingKyc.length === 0 ? (
+              <div className="card p-14 text-center">
+                <div className="w-16 h-16 rounded-3xl bg-emerald-50 flex items-center justify-center text-3xl mx-auto mb-5">✅</div>
+                <h3 className="font-bold text-slate-900 text-lg mb-2">All clear!</h3>
+                <p className="text-slate-500 text-sm">No pending KYC submissions to review.</p>
+              </div>
+            ) : (
+              <div className="grid sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                {pendingKyc.map(u => {
+                  const isSelected = selectedKycIds.has(u.id);
+                  return (
+                    <div key={u.id}
+                      className={`card p-5 space-y-4 cursor-pointer transition-all ${isSelected ? 'ring-2 ring-brand-500 bg-brand-50/30' : 'hover:ring-1 hover:ring-slate-200'}`}
+                      onClick={() => toggleKycSelection(u.id)}>
+                      <div className="flex items-start justify-between gap-2">
+                        {/* Checkbox */}
+                        <div className="flex items-center gap-3">
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => toggleKycSelection(u.id)}
+                            onClick={e => e.stopPropagation()}
+                            className="w-4 h-4 rounded border-slate-300 text-brand-600 focus:ring-brand-500 cursor-pointer"
+                            aria-label={`Select ${u.email} for bulk action`}
+                          />
+                          <div className="w-10 h-10 rounded-2xl bg-slate-100 flex items-center justify-center font-bold text-slate-600">
+                            {u.email[0].toUpperCase()}
+                          </div>
+                          <div>
+                            <p className="font-semibold text-slate-900 text-sm truncate max-w-[140px] md:max-w-[160px]">{u.email}</p>
+                            <p className="text-xs text-slate-400">{u.country}</p>
+                          </div>
+                        </div>
+                        <span className={ROLE_BADGE[u.role] ?? 'badge-gray'}>{u.role}</span>
+                      </div>
+
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="text-slate-400">Submitted {new Date(u.createdAt).toLocaleDateString()}</span>
+                        <span className="badge-yellow">pending</span>
+                      </div>
+
+                      <button
+                        disabled={actionId === u.id}
+                        onClick={e => { e.stopPropagation(); approveKyc(u.id); }}
+                        className="btn-primary w-full text-sm py-2.5">
+                        {actionId === u.id ? (
+                          <span className="flex items-center gap-2">
+                            <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
+                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                            </svg>
+                            Approving…
+                          </span>
+                        ) : '✓ Approve KYC'}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Blockchain tab */}
+        {tab === 'blockchain' && (
+          <BlockchainTab token={getStoredToken() ?? ''} toast={toast} />
+        )}
+
+        {/* Failed Payments tab */}
+        {tab === 'payments' && (
+          <FailedPaymentsTab
+            payments={failedPayments}
+            meta={failedPaymentsMeta}
+            loading={failedPaymentsLoading}
+            retryingId={retryingId}
+            page={failedPaymentsPage}
+            onRetry={retryPayment}
+            onPageChange={loadFailedPayments}
+            onRefresh={() => loadFailedPayments(failedPaymentsPage)}
+          />
+        )}
+      </div>
+    </DashboardLayout>
+  );
+}
+
+// ── Failed Payments Tab ───────────────────────────────────────────────────────
+
+interface FailedPaymentsTabProps {
+  payments: FailedPayment[];
+  meta: PaginatedFailedPayments['meta'] | null;
+  loading: boolean;
+  retryingId: string | null;
+  page: number;
+  onRetry: (txId: string) => void;
+  onPageChange: (page: number) => void;
+  onRefresh: () => void;
+}
+
+function FailedPaymentsTab({
+  payments,
+  meta,
+  loading,
+  retryingId,
+  page,
+  onRetry,
+  onPageChange,
+  onRefresh,
+}: FailedPaymentsTabProps) {
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="section-title">Failed Payment Alerts</h2>
+          <p className="text-sm text-slate-500 mt-1">
+            Escrow transactions that failed and require admin attention.
+          </p>
+        </div>
+        <button
+          onClick={onRefresh}
+          disabled={loading}
+          className="btn-secondary flex items-center gap-2 text-sm px-4 py-2"
+          aria-label="Refresh failed payments list"
+        >
+          <svg
+            className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`}
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={2}
+            viewBox="0 0 24 24"
+            aria-hidden="true"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+            />
+          </svg>
+          {loading ? 'Loading…' : 'Refresh'}
+        </button>
+      </div>
+
+      {/* Summary badge */}
+      {meta && meta.total > 0 && (
+        <div className="flex items-center gap-3 p-4 bg-red-50 border border-red-200 rounded-xl">
+          <div className="w-10 h-10 rounded-xl bg-red-100 flex items-center justify-center text-xl" aria-hidden="true">
+            ⚠️
+          </div>
+          <div>
+            <p className="font-semibold text-red-800 text-sm">
+              {meta.total} failed payment{meta.total !== 1 ? 's' : ''} require attention
+            </p>
+            <p className="text-xs text-red-600 mt-0.5">
+              Review each transaction below and trigger a retry if appropriate.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Loading skeleton */}
+      {loading && (
+        <div className="space-y-3">
+          {[1, 2, 3].map((i) => (
+            <div key={i} className="card h-20 skeleton" />
+          ))}
+        </div>
+      )}
+
+      {/* Empty state */}
+      {!loading && payments.length === 0 && (
+        <div className="card p-14 text-center">
+          <div className="w-16 h-16 rounded-3xl bg-emerald-50 flex items-center justify-center text-3xl mx-auto mb-5" aria-hidden="true">
+            ✅
+          </div>
+          <h3 className="font-bold text-slate-900 text-lg mb-2">No failed payments</h3>
+          <p className="text-slate-500 text-sm">
+            All escrow transactions are processing normally.
+          </p>
+        </div>
+      )}
+
+      {/* Payments table */}
+      {!loading && payments.length > 0 && (
+        <div className="table-wrapper">
+          <div className="overflow-x-auto">
+            <table className="w-full" aria-label="Failed escrow payments">
+              <thead className="table-head">
+                <tr>
+                  {['Transaction ID', 'Deal / Commodity', 'Error Code', 'TX Hash', 'Date', 'Action'].map((h) => (
+                    <th key={h} className="table-th" scope="col">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {payments.map((payment) => (
+                  <tr key={payment.id} className="table-row">
+                    {/* Transaction ID */}
+                    <td className="table-td font-mono text-xs text-slate-600" title={payment.id}>
+                      {payment.id.substring(0, 8)}…
+                    </td>
+
+                    {/* Deal / Commodity */}
+                    <td className="table-td">
+                      {payment.dealId ? (
+                        <div>
+                          <p className="text-sm font-medium text-slate-900">
+                            {payment.dealCommodity ?? 'Unknown commodity'}
+                          </p>
+                          <p className="font-mono text-[10px] text-slate-400" title={payment.dealId}>
+                            {payment.dealId.substring(0, 8)}…
+                          </p>
+                        </div>
+                      ) : (
+                        <span className="text-slate-400 text-sm italic">No deal linked</span>
+                      )}
+                    </td>
+
+                    {/* Error Code */}
+                    <td className="table-td">
+                      {payment.errorCode ? (
+                        <span className="badge-red font-mono text-xs">
+                          {payment.errorCode}
+                        </span>
+                      ) : (
+                        <span className="text-slate-400 text-xs">—</span>
+                      )}
+                    </td>
+
+                    {/* TX Hash */}
+                    <td className="table-td font-mono text-xs text-slate-500" title={payment.txHash ?? ''}>
+                      {payment.txHash ? `${payment.txHash.substring(0, 12)}…` : '—'}
+                    </td>
+
+                    {/* Date */}
+                    <td className="table-td text-xs text-slate-400">
+                      <time dateTime={payment.createdAt}>
+                        {new Date(payment.createdAt).toLocaleString()}
+                      </time>
+                    </td>
+
+                    {/* Retry action */}
+                    <td className="table-td">
+                      <button
+                        disabled={retryingId === payment.id || !payment.dealId}
+                        onClick={() => onRetry(payment.id)}
+                        title={!payment.dealId ? 'Cannot retry: no deal linked' : 'Trigger manual retry'}
+                        aria-label={`Retry transaction ${payment.id.substring(0, 8)}`}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                      >
+                        {retryingId === payment.id ? (
+                          <>
+                            <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24" aria-hidden="true">
+                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                            </svg>
+                            Retrying…
+                          </>
+                        ) : (
+                          <>
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24" aria-hidden="true">
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                            </svg>
+                            Retry
+                          </>
+                        )}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Pagination */}
+          {meta && meta.totalPages > 1 && (
+            <div className="flex items-center justify-between px-5 py-4 border-t border-slate-100">
+              <p className="text-xs text-slate-500">
+                Showing page {meta.page} of {meta.totalPages} ({meta.total} total)
+              </p>
+              <div className="flex gap-2">
+                <button
+                  disabled={page <= 1}
+                  onClick={() => onPageChange(page - 1)}
+                  aria-label="Previous page"
+                  className="px-3 py-1.5 rounded-lg text-xs font-semibold border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  ← Prev
+                </button>
+                <button
+                  disabled={page >= meta.totalPages}
+                  onClick={() => onPageChange(page + 1)}
+                  aria-label="Next page"
+                  className="px-3 py-1.5 rounded-lg text-xs font-semibold border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  Next →
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Blockchain Tab ────────────────────────────────────────────────────────────
+
+interface BlockchainTabProps {
+  token: string;
+  toast: (msg: string, type: 'success' | 'error') => void;
+}
+
+function BlockchainTab({ token, toast }: BlockchainTabProps) {
+  const [contractId, setContractId] = useState('');
+  const [action, setAction] = useState<'approve' | 'pause' | 'fail' | 'milestone' | 'distribute'>('approve');
+  const [milestoneIndex, setMilestoneIndex] = useState(0);
+  const [revenueAmount, setRevenueAmount] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<string | null>(null);
+
+  const handleAction = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!contractId.trim()) return;
+    setLoading(true);
+    setResult(null);
+
+    try {
+      let url = `/api/soroban/campaign/${contractId.trim()}/${action}`;
+      let body: Record<string, unknown> = {};
+
+      if (action === 'milestone') body = { milestoneIndex };
+      if (action === 'distribute') body = { revenueAmountStroops: revenueAmount };
+
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        toast(`✅ ${action} succeeded`, 'success');
+        setResult(data.txHash ?? JSON.stringify(data));
+      } else {
+        toast(data.message ?? 'Action failed', 'error');
+      }
+    } catch {
+      toast('Request failed', 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="section-title">Soroban Contract Management</h2>
+        <p className="text-sm text-slate-500 mt-1">
+          Invoke on-chain actions on FarmCampaign smart contracts.
+        </p>
+      </div>
+
+      <div className="grid sm:grid-cols-2 gap-5">
+        {/* Action form */}
+        <div className="card p-5">
+          <h3 className="font-semibold text-slate-900 mb-4">Contract Action</h3>
+          <form onSubmit={handleAction} className="space-y-4">
+            <div>
+              <label className="label">Contract ID</label>
+              <input className="input font-mono text-xs" placeholder="C..." value={contractId}
+                onChange={e => setContractId(e.target.value)} required />
+            </div>
+
+            <div>
+              <label className="label">Action</label>
+              <select className="select" value={action}
+                onChange={e => setAction(e.target.value as typeof action)}>
+                <option value="approve">✅ Approve Campaign</option>
+                <option value="milestone">📍 Release Milestone</option>
+                <option value="distribute">💰 Distribute Revenue</option>
+                <option value="pause">⏸ Pause Campaign</option>
+                <option value="fail">❌ Mark Failed</option>
+              </select>
+            </div>
+
+            {action === 'milestone' && (
+              <div>
+                <label className="label">Milestone Index (0-based)</label>
+                <input className="input" type="number" min={0} max={3} value={milestoneIndex}
+                  onChange={e => setMilestoneIndex(Number(e.target.value))} />
+              </div>
+            )}
+
+            {action === 'distribute' && (
+              <div>
+                <label className="label">Revenue Amount (USDC stroops)</label>
+                <input className="input" placeholder="e.g. 500000000000 = 50,000 USDC"
+                  value={revenueAmount} onChange={e => setRevenueAmount(e.target.value)} required />
+                <p className="label-hint">1 USDC = 10,000,000 stroops</p>
+              </div>
+            )}
+
+            <button type="submit" disabled={loading} className="btn-primary w-full">
+              {loading ? 'Submitting…' : 'Execute On-Chain'}
+            </button>
+          </form>
+
+          {result && (
+            <div className="mt-4 p-3 bg-emerald-50 rounded-xl">
+              <p className="text-xs text-emerald-700 font-semibold mb-1">Transaction Hash</p>
+              <p className="font-mono text-xs text-emerald-900 break-all">{result}</p>
+            </div>
+          )}
+        </div>
+
+        {/* Info panel */}
+        <div className="card p-5 space-y-4">
+          <h3 className="font-semibold text-slate-900">Contract Lifecycle</h3>
+          {[
+            { step: '1', label: 'Deal Published', desc: 'Soroban FarmCampaign auto-initialized on deal.publish queue event' },
+            { step: '2', label: 'Approve Campaign', desc: 'After KYC + funding target reached, admin approves on-chain' },
+            { step: '3', label: 'Release Milestones', desc: 'Release 1 of 4 tranches to farmer per verified milestone' },
+            { step: '4', label: 'Distribute Revenue', desc: 'After harvest sales, distribute USDC to all investors proportionally' },
+          ].map(item => (
+            <div key={item.step} className="flex gap-3">
+              <div className="w-7 h-7 rounded-full bg-green-600 text-white text-xs font-bold flex items-center justify-center flex-shrink-0">
+                {item.step}
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-slate-900">{item.label}</p>
+                <p className="text-xs text-slate-500">{item.desc}</p>
+              </div>
+            </div>
+          ))}
+
+          <div className="pt-2 border-t border-slate-100">
+            <a href="/transparency" target="_blank"
+              className="text-sm text-green-600 hover:underline font-medium">
+              🔍 View public transparency page →
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
